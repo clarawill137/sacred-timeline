@@ -1,0 +1,11 @@
+{
+    "display_name": "Священный таймлайн",
+    "loading_order": 90,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Daria + Claude",
+    "version": "0.1.0",
+    "homePage": "https://github.com/clarawill137/sacred-timeline"
+}
