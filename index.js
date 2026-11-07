@@ -13,7 +13,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.8.3';
+const VERSION = '0.8.4';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true, chronicle: true };
 const WHO_KEY = 'sacred_timeline_who';
@@ -271,12 +271,15 @@ export function mentionRegex(data, identity, rosterName) {
 // ───────────── лорбуки ─────────────
 
 const covers = (s, at) => (s.from == null || s.from <= at) && (s.to == null || at < s.to);
+/** gc.public: true — знают все; дата — тайна до неё, дальше знают все (силы стали новостью и т. п.). */
+const isPublic = (g, at) => g?.public === true || (typeof g?.public === 'string' && !!at && String(g.public) <= String(at));
 
 /**
  * Решение по записи лорбука для эпохи и даты.
  * Книга со списком эпох — только в них. Запись с gc.eras — только в своих эпохах (gc.inject — ядро её включает).
  * Запись Хроники, которая начинается позже даты чата, — из будущего, вон.
  * Тайна с картой знания (gc.knows) — только если говорящий знает её на эту дату; «обрывки» — не знание;
+ * gc.public (true или дата) — с этой даты тайну знают все;
  * говорящий не опознан — тайну не даём (кому она известна, записано явно, а его в списке нет).
  * Без карты знания: событие из личного времени персоны (gc.personal) позже её «сейчас» в этой эпохе — она его
  * ещё не прожила, вон. Карта знания важнее: если говорящий знает, а персона ещё нет — это петля, ему можно.
@@ -298,7 +301,7 @@ export function judgeEntry(entry, { eraId, date, eraFrom, speaker, personaId, pe
     if (!date && at && g.from && String(g.from) > at) return 'drop';
     // состояние видно только внутри своего отрезка (с from по to)
     if (at && g.kind === 'state' && g.to && String(at) > String(g.to) && !String(at).startsWith(String(g.to))) return 'drop';
-    if (g.secret && g.knows && typeof g.knows === 'object') {
+    if (g.secret && g.knows && typeof g.knows === 'object' && !isPublic(g, date || eraFrom)) {
         // память своей эпохи: рассказчику и неопознанным NPC видна — сцены рассказывали они
         if (g.kind === 'memory' && String(g.era) === String(eraId) && !speaker) return 'keep';
         const at = date || eraFrom;
@@ -655,7 +658,7 @@ export function legacyChronicleActive(book, eraId) {
  */
 export function chronicleBlock(book, scope, books, { world, eraFrom, ahead = 4, maxPast = 40 } = {}) {
     const at = scope?.date || scope?.eraFrom;
-    const out = { text: '', past: 0, ahead: 0 };
+    const out = { text: '', past: 0, ahead: 0, held: 0 };
     if (!book?.entries || !at) return out;
     const all = Object.entries(book.entries)
         .map(([k, e]) => ({ ...e, uid: e?.uid ?? Number(k) }))
@@ -675,8 +678,10 @@ export function chronicleBlock(book, scope, books, { world, eraFrom, ahead = 4, 
         const id = Number(e.uid);
         if (memo.has(id)) return memo.get(id);
         const g = e.gc;
-        const open = g.kind === 'fixed' || g.public;
-        let ok = judgeEntry({ ...e, world, disable: false }, scope, books) !== 'drop';
+        const open = g.kind === 'fixed' || isPublic(g, at);
+        // сыграно раньше расчётной даты — судим по дате сцены
+        const gg = typeof g.played === 'string' && g.played ? { ...g, from: g.played } : g;
+        let ok = judgeEntry({ ...e, gc: gg, world, disable: false }, scope, books) !== 'drop';
         if (ok && !open && g.parent != null) {
             const p = byUid.get(Number(g.parent));
             if (p?.gc?.secret && !knowsAt(p.gc)) ok = false;   // подсобытие тайного отрезка — тайна и само
@@ -685,14 +690,26 @@ export function chronicleBlock(book, scope, books, { world, eraFrom, ahead = 4, 
         memo.set(id, ok);
         return ok;
     };
-    const seen = all.filter(e => String(e.gc.from) <= at
+    // событие своей эпохи — позже её начала (или крупнее: год, в котором она начинается) — в «что было», только когда
+    // сыграно: gc.played (true или дата сцены) или пришло из чата (src.chat / src.stmb). Ролка могла до него ещё не
+    // дойти — сводка не должна обгонять чат. Дата ровно в начало эпохи — завязка, она уже была.
+    const played = (g) => !!g.played || (typeof g.src === 'object' && !!(g.src?.chat || g.src?.stmb));
+    const held = (g) => {
+        if (g.kind !== 'event' || played(g)) return false;
+        const f = String(g.from);
+        return f > from || (f !== from && from.startsWith(f));
+    };
+    const when = (g) => (typeof g.played === 'string' && g.played ? g.played : String(g.from));
+    const seen = all.filter(e => when(e.gc) <= at
+        && !held(e.gc)
         && !(e.gc.kind === 'state' && e.gc.to && !(at < String(e.gc.to)))
         && visible(e));
+    out.held = all.filter(e => held(e.gc) && String(e.gc.from) <= at && visible(e)).length;
     const keep = new Set(seen);
     const past = seen.filter(e => {
         const p = e.gc.parent != null ? byUid.get(Number(e.gc.parent)) : null;
         return !(p && keep.has(p) && p.gc.to && String(p.gc.to) <= from);   // далёкий отрезок — одной строкой родителя
-    }).sort((a, b) => String(a.gc.from).localeCompare(String(b.gc.from)));
+    }).sort((a, b) => when(a.gc).localeCompare(when(b.gc)));
     const tail = past.slice(-maxPast);
     const next = all.filter(e => e.gc.kind === 'fixed' && String(e.gc.from) > at)
         .sort((a, b) => String(a.gc.from).localeCompare(String(b.gc.from))).slice(0, ahead);
@@ -1334,7 +1351,7 @@ async function onGenerationStarted() {
             if (book?.entries && !legacyChronicleActive(book, era.id)) {
                 const res = chronicleBlock(book, scopeFor(data, era, date, ctx()), w.books || {}, { world: w.chronicle, eraFrom: era.from });
                 text = res.text;
-                lastChron = { past: res.past, ahead: res.ahead };
+                lastChron = { past: res.past, ahead: res.ahead, held: res.held };
             }
         }
         ctx().setExtensionPrompt(CHRON_KEY, text, IN_PROMPT, 0, false, ROLE_SYSTEM);
@@ -1425,7 +1442,7 @@ function statusLines() {
     }
     if (lastHistory?.added?.length) out.push(`Память прошлых эпох: ${esc(lastHistory.added.join(', '))} — записей ${lastHistory.entries} (дальше — по дате и кто знает)`);
     if (!settings().chronicle) out.push('Хроника под дату: выключено');
-    else if (lastChron) out.push(`Хроника под дату: прошлое — ${lastChron.past} ${plural(lastChron.past, 'строка', 'строки', 'строк')}, впереди фиксированных точек — ${lastChron.ahead} (режиссёру)`);
+    else if (lastChron) out.push(`Хроника под дату: прошлое — ${lastChron.past} ${plural(lastChron.past, 'строка', 'строки', 'строк')}, впереди фиксированных точек — ${lastChron.ahead} (режиссёру)${lastChron.held ? `; событий этой эпохи ждут игры — ${lastChron.held}` : ''}`);
     if (!settings().who) out.push('Кто есть кто: выключено');
     else if (lastWho !== null) out.push(lastWho ? `Кто есть кто: ${lastWho} ${plural(lastWho, 'строка', 'строки', 'строк')} в промпте` : 'Кто есть кто: для этой эпохи нет');
     return out;
