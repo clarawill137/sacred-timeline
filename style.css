@@ -20,3 +20,11 @@
 .st-strazh-d { display: none; margin-top: 4px; opacity: 0.85; }
 .st-strazh.open .st-strazh-d { display: block; }
 .st-strazh-ok { text-decoration: underline; cursor: pointer; opacity: 0.8; }
+.st-draft-x:empty { display: none; }
+.st-draft-x { margin-top: 6px; }
+.st-own-text { width: 100%; box-sizing: border-box; }
+.st-prune-p { margin: 4px 0; }
+.st-prune-p summary { cursor: pointer; opacity: 0.85; }
+.st-prune-old, .st-prune-new { white-space: pre-wrap; font-size: 0.85em; padding: 4px 6px; margin: 4px 0; border-radius: 4px; }
+.st-prune-old { background: rgba(208, 69, 59, 0.08); text-decoration: line-through; opacity: 0.7; }
+.st-prune-new { background: rgba(80, 170, 90, 0.1); }
