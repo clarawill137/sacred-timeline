@@ -97,6 +97,42 @@ ct_rm() {
   else docker exec -u 0 "$CT" rm -f "$DATA/$1"; fi
 }
 
+# ST 1.18 пересобирает миниатюру, только если её нет: подмену картинки мимо самого ST
+# (как делает мост) он не замечает и показывает старую. Поэтому миниатюру сносим — ST
+# соберёт свежую при следующем показе.
+thumb_of() { # путь картинки → путь её миниатюры (или пусто)
+  case $1 in
+    characters/*)     printf 'thumbnails/avatar/%s' "${1#characters/}" ;;
+    "User Avatars/"*) printf 'thumbnails/persona/%s' "${1#User Avatars/}" ;;
+    backgrounds/*)    printf 'thumbnails/bg/%s' "${1#backgrounds/}" ;;
+  esac
+}
+
+# снести все миниатюры старше своей картинки (или без картинки); печатает их число
+ct_fix_thumbs() {
+  local script='cd "$1" 2>/dev/null || { echo 0; exit 0; }
+n=0
+for pair in "characters|thumbnails/avatar" "User Avatars|thumbnails/persona" "backgrounds|thumbnails/bg"; do
+  src=${pair%%|*}; th=${pair#*|}
+  [ -d "$th" ] || continue
+  for t in "$th"/*; do
+    [ -f "$t" ] || continue
+    o="$src/${t##*/}"
+    if [ ! -f "$o" ] || [ "$o" -nt "$t" ]; then rm -f "$t" && n=$((n+1)); fi
+  done
+done
+echo "$n"'
+  if [[ -n $FAKE ]]; then sh -c "$script" sh "$FAKE$DATA" 2>/dev/null || echo 0
+  else docker exec -u 0 "$CT" sh -c "$script" sh "$DATA" 2>/dev/null || echo 0; fi
+}
+
+fix_thumbs() {
+  local n; n=$(ct_fix_thumbs | tail -n 1)
+  [[ $n =~ ^[0-9]+$ ]] || n=0
+  if (( n > 0 )); then say "🖼  Обновила устаревшие миниатюры карточек/аватарок: $n — ST соберёт их заново."; fi
+  return 0
+}
+
 # строки «размер|mtime|путь» для chats/*/*.jsonl и group chats/*.jsonl
 ct_chat_index() {
   if [[ -n $FAKE ]]; then
@@ -418,6 +454,8 @@ apply_changes() {
       ct_put "$MIRROR/$rel" "$rel"
       ct_chown "$owner" "$rel"
     fi
+    local th; th=$(thumb_of "$rel")
+    if [[ -n $th ]]; then ct_rm "$th"; fi
   done
   # проверка: на сервере ровно то, что в зеркале
   local -a put=()
@@ -450,8 +488,8 @@ after_apply_hint() {
     fi
   done
   for p in "${CH_PATH[@]}"; do
-    if [[ $p == characters/* ]]; then
-      say "   Менялись карточки — если ST покажет старое, перезапусти: docker restart $CT"
+    if [[ $p == characters/* || $p == "User Avatars/"* ]]; then
+      say "   Менялись картинки — их миниатюры я снесла, ST соберёт свежие. Если Safari упрямится — обнови страницу ещё раз."
       break
     fi
   done
@@ -464,6 +502,7 @@ cmd_sync() {
   ct_check
   lock
   recover_git
+  fix_thumbs
   say "⏳ Снимаю сервер…"
   g fetch -q origin 2>/dev/null || die "Нет связи с GitHub. Запусти: st-sync setup"
   snapshot "сервер: снимок $(date '+%Y-%m-%d %H:%M')"
