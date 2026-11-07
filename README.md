@@ -123,6 +123,7 @@ const cx = window.SacredTimeline?.context();   // null — чат вне мир�
 //   speaker: { identity, slice, avatar } | null,    // кто сейчас говорит (в группе — на каждом ходу свой)
 //   cast:    [{ identity, slice, name, card }],     // состав эпохи по обличьям
 //   persona: { identity, slice, avatar } | null,    // обличье персоны в эпохе
+//   people:  { [имя в чате]: { identity, slice, label } },  // участники чата и персона — для данных «по имени»
 //   ext:     { [id расширки]: 'on' | 'off' | 'quiet' | 'hidden' | свой режим },
 // }
 window.SacredTimeline?.mode('my-ext');          // режим расширки здесь; вне эпох — 'on'
@@ -132,6 +133,7 @@ const seen = await window.SacredTimeline?.visible(entries, 'Имя книги');
 // Хронограф (лента эпох, как в Фойе): эпохи с чатами, составом и очередью канона + события Хроники (вид автора):
 const map = await window.SacredTimeline?.chronograph();   // { world, span, eras: [...], events: [...] } | null
 await window.SacredTimeline?.enter('id эпохи');           // открыть её каноничный чат — дальше ядро переключит всё само
+await window.SacredTimeline?.sliceAt('Имя', '2014-05');   // облик человека на дату: { identity, slice, label } | null
 
 // снимок поменялся (чат, эпоха, дата, говорящий):
 SillyTavern.getContext().eventSource.on('sacred-timeline:changed', cx => { /* … */ });
@@ -139,7 +141,8 @@ window.addEventListener('sacred-timeline:changed', e => { const cx = e.detail; /
 ```
 
 Личность (`identity`) — один человек сквозь все годы, обличье (`slice`) — он на отрезке времени (своя карточка
-или персона). Хранить данные «по личности + обличью» — значит не путать годы и не видеть будущего.
+или персона). Хранить данные «по личности + обличью» — значит не путать годы и не видеть будущего: расширка, которая
+держит что-то по имени персонажа (шкаф, вкусы, распорядок), берёт `context().people[имя].slice` и помечает им запись.
 
 ## st-sync — правки без переустановок
 

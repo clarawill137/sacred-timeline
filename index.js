@@ -15,7 +15,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.9.2';
+const VERSION = '0.9.3';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true, chronicle: true, strazh: true, chronist: true, reviser: '' };
 const WHO_KEY = 'sacred_timeline_who';
@@ -1266,7 +1266,8 @@ export function chronographModel(data, book) {
             text: String(e.content || '').slice(0, 1200),
         }))
         .sort((a, b) => a.from.localeCompare(b.from) || a.uid - b.uid);
-    return { world: w ? { id: w.id, name: w.name || w.id } : null, span: ['1917', '2025'], eras, events };
+    return { world: w ? { id: w.id, name: w.name || w.id } : null, defaultEra: w?.defaultEra ? String(w.defaultEra) : null,
+        span: ['1917', '2025'], eras, events };
 }
 
 /** Войти в эпоху: открыть её каноничный (или указанный) чат — группу или чат карточки из состава эпохи. */
@@ -1498,6 +1499,24 @@ export function buildContext(data, cur, c) {
     const speakerId = speakerOf(data, ch, c?.name2);
     const sp = speakerId ? sliceOf(data, speakerId, { avatar: ch?.avatar, date: cur.date || era.from }) : null;
     const pr = sliceById(data, era.persona);
+    // кто есть кто в этом чате по именам — для расширок, которые хранят данные по имени персонажа (шкаф, жизнь):
+    // имя → личность и её облик на дату чата; персона (name1) — облик эпохи
+    const people = {};
+    const at = cur.date || era.from;
+    const addPerson = (name, avatar) => {
+        if (!name || people[name]) return;
+        const id = speakerOf(data, { avatar, name }, name);
+        if (!id) return;
+        const sl = sliceOf(data, id, { avatar, date: at });
+        people[name] = { identity: id, slice: sl?.id || null, label: sl?.label || null };
+    };
+    const group = c?.groupId ? (c.groups || []).find(g => g.id === c.groupId) : null;
+    for (const av of group?.members || []) {
+        const m = (c?.characters || []).find(x => x.avatar === av);
+        if (m) addPerson(m.name, m.avatar);
+    }
+    if (!group && ch) addPerson(ch.name, ch.avatar);
+    if (pr && c?.name1) people[c.name1] = { identity: pr.identity.id, slice: pr.slice.id, label: pr.slice.label || null };
     return {
         v: 1,
         world: w ? { id: w.id || null, name: w.name || null, chronicle: w.chronicle || null } : null,
@@ -1511,6 +1530,7 @@ export function buildContext(data, cur, c) {
         speaker: speakerId ? { identity: speakerId, slice: sp?.id || null, avatar: ch?.avatar || null } : null,
         cast: (era.cast || []).map(short).filter(Boolean),
         persona: pr ? { identity: pr.identity.id, slice: pr.slice.id, avatar: pr.slice.persona || pr.identity.persona || null } : null,
+        people,
         ext: extModes(data, era, cur.explicit),
     };
 }
@@ -2316,6 +2336,14 @@ if (typeof jQuery === 'function') {
             },
             /** Войти в эпоху: открыть её каноничный чат (или chatId) — дальше ядро переключит всё само. */
             enter: (eraId, chatId) => enterEra(eraId, chatId),
+            /** Облик человека на дату (по имени или алиасу личности, необязательно — по карточке): { identity, slice, label } | null. */
+            sliceAt: async (name, date, avatar) => {
+                const data = await loadRegistry();
+                const id = data ? speakerOf(data, { avatar, name }, name) || findIdentity(data, name)?.id : null;
+                if (!id) return null;
+                const sl = sliceOf(data, id, { avatar, date });
+                return { identity: id, slice: sl?.id || null, label: sl?.label || null };
+            },
             present: async (name, date) => {
                 const data = await loadRegistry();
                 const id = data && findIdentity(data, name);
