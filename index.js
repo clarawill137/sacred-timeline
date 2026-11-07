@@ -13,7 +13,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.8.1';
+const VERSION = '0.8.2';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true, chronicle: true };
 const WHO_KEY = 'sacred_timeline_who';
@@ -293,6 +293,11 @@ export function judgeEntry(entry, { eraId, date, eraFrom, speaker, personaId, pe
     }
     if (entry.disable) return 'keep';
     if (date && g.from && String(g.from) > date) return 'drop';
+    // книга личности (одна на человека): часть эпохи без даты чата меряем началом эпохи — чужие годы не смешиваются
+    const at = date || (g.part ? eraFrom : null);
+    if (!date && at && g.from && String(g.from) > at) return 'drop';
+    // состояние видно только внутри своего отрезка («Наташа жива» — до 10.2023)
+    if (at && g.kind === 'state' && g.to && String(at) > String(g.to) && !String(at).startsWith(String(g.to))) return 'drop';
     if (g.secret && g.knows && typeof g.knows === 'object') {
         // память своей эпохи: рассказчику и неопознанным NPC видна — сцены рассказывали они
         if (g.kind === 'memory' && String(g.era) === String(eraId) && !speaker) return 'keep';
@@ -938,7 +943,7 @@ export function guardSetting(obj, key, show, unshow = v => v) {
     let value = d.value;
     const get = () => show(value);
     get[GATE] = () => value;
-    Object.defineProperty(obj, key, { configurable: true, enumerable: true, get, set: v => { value = unshow(v); } });
+    Object.defineProperty(obj, key, { configurable: true, enumerable: true, get, set: v => { value = unshow(v, value); } });
     if (!Object.prototype.hasOwnProperty.call(obj, 'toJSON')) {
         Object.defineProperty(obj, 'toJSON', {
             configurable: true, enumerable: false, writable: true,
@@ -984,8 +989,14 @@ export function rosterUnview(text) {
 /** Списки персонажей в настройках расширок (views в каталоге): [{ id, settings, key }]. */
 export function catalogViews(data) {
     return records(data, 'ext').flatMap(x => (x.views || [])
-        .filter(v => v && v.settings && v.key && (v.kind || 'roster') === 'roster')
-        .map(v => ({ id: x.id, settings: String(v.settings), key: String(v.key) })));
+        .filter(v => v && v.settings && v.key && ['roster', 'eras'].includes(v.kind || 'roster'))
+        .map(v => ({ id: x.id, settings: String(v.settings), key: String(v.key), kind: v.kind || 'roster',
+            eras: Array.isArray(v.eras) ? v.eras.map(String) : [] })));
+}
+
+/** Поле, нужное только в своих эпохах (kind 'eras'): в остальных расширка видит пустое; пустое не записывается. */
+export function erasView(value, eraId, eras) {
+    return eraId && eras.includes(String(eraId)) ? value : '';
 }
 
 /** Заслонки из каталога: [{ id, settings, key }] — у расширок с главным выключателем (gate). */
@@ -1059,7 +1070,7 @@ let guardKeys = [];
 let closed = new Set();   // расширки, выключенные в эпохе (режим off) — для заслонок
 let gates = [];
 let views = [];          // списки персонажей в настройках расширок
-let viewState = { data: null, date: null };
+let viewState = { data: null, date: null, eraId: null };
 
 /** Охрана промптов и заслонки: на всё из каталога (расширки заводят ключи по ходу — зовётся перед каждой генерацией). */
 function armGuard() {
@@ -1069,7 +1080,13 @@ function armGuard() {
         if (store && guardKeys.length) guardPrompts(store, guardKeys, key => muted.has(key));
         for (const g of gates) gateSetting(c.extensionSettings?.[g.settings], g.key, () => closed.has(g.id));
         for (const v of views) {
-            guardSetting(c.extensionSettings?.[v.settings], v.key, t => rosterView(t, viewState.data, viewState.date), rosterUnview);
+            const obj = c.extensionSettings?.[v.settings];
+            if (v.kind === 'eras') {
+                const inEra = () => !!viewState.eraId && v.eras.includes(String(viewState.eraId));
+                guardSetting(obj, v.key, t => erasView(t, viewState.eraId, v.eras), (t, real) => (t === '' && !inEra() ? real : t));
+            } else {
+                guardSetting(obj, v.key, t => rosterView(t, viewState.data, viewState.date), t => rosterUnview(t));
+            }
         }
     } catch (e) { console.warn(TAG, 'охрана расширок не встала', e); }
 }
@@ -1109,7 +1126,7 @@ async function publish(data) {
     guardKeys = data ? catalogKeys(data) : [];
     gates = data ? catalogGates(data) : [];
     views = data ? catalogViews(data) : [];
-    viewState = { data, date: cx?.era ? (current.date || cx.era.from || null) : null };
+    viewState = { data, date: cx?.era ? (current.date || cx.era.from || null) : null, eraId: cx?.era?.id || null };
     armGuard();
     applyPolicyCss(data);
     applyBodyAttrs(cx);
