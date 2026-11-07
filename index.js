@@ -296,7 +296,7 @@ export function judgeEntry(entry, { eraId, date, eraFrom, speaker, personaId, pe
     // книга личности (одна на человека): часть эпохи без даты чата меряем началом эпохи — чужие годы не смешиваются
     const at = date || (g.part ? eraFrom : null);
     if (!date && at && g.from && String(g.from) > at) return 'drop';
-    // состояние видно только внутри своего отрезка («Наташа жива» — до 10.2023)
+    // состояние видно только внутри своего отрезка (с from по to)
     if (at && g.kind === 'state' && g.to && String(at) > String(g.to) && !String(at).startsWith(String(g.to))) return 'drop';
     if (g.secret && g.knows && typeof g.knows === 'object') {
         // память своей эпохи: рассказчику и неопознанным NPC видна — сцены рассказывали они
