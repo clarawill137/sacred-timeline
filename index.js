@@ -11,7 +11,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.6.1';
+const VERSION = '0.6.2';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true };
 const WHO_KEY = 'sacred_timeline_who';
@@ -390,6 +390,17 @@ export function wantedPersona(av, explicit, current, mine = []) {
  * Двойник базовой персоны под аватар эпохи: то же имя, описание — базовое с правками эпохи (его видят и другие
  * расширки, читающие персону), без привязок к персонажам.
  */
+/**
+ * ST сам заводит персону «[Unnamed Persona]» с пустым описанием для каждой новой картинки в User Avatars.
+ * Это заглушка, а не персона, которую завели руками, — двойник её спокойно заменяет.
+ */
+export function isPlaceholderPersona(pu, avatar) {
+    if (!pu?.personas || !(avatar in pu.personas)) return false;
+    const name = String(pu.personas[avatar] ?? '').trim();
+    const desc = String(pu.persona_descriptions?.[avatar]?.description ?? '').trim();
+    return !desc && (!name || /^\[.*\]$/.test(name));
+}
+
 export function clonePersona(pu, base, avatar, patches = []) {
     const desc = pu?.persona_descriptions?.[base];
     if (!pu?.personas?.[base] || !desc) return false;
@@ -441,7 +452,7 @@ async function syncPersonaAvatar(data, era, explicit) {
     if (files && !files.includes(target)) { lastAvatar.missing = target; return; }
     const c = ctx();
     const pu = c.powerUserSettings;
-    if (target !== av.base && pu && (!pu.personas?.[target] || mine.includes(target))) {
+    if (target !== av.base && pu && (!pu.personas?.[target] || mine.includes(target) || isPlaceholderPersona(pu, target))) {
         // двойник держится в ногу с базовой персоной: правишь её — двойник обновится при следующем входе
         if (clonePersona(pu, av.base, target, era.personaPatches) && !mine.includes(target)) mine.push(target);
         c.saveSettingsDebounced?.();
