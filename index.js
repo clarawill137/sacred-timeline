@@ -1,16 +1,27 @@
-// Священный таймлайн — ядро, v0.1.
-// Узнаёт эпоху открытого чата по Реестру мира (лорбук на сервере, имя кончается на «Реестр»)
-// и убирает из Закулисья тех, кого в этой эпохе нет: умер, пыль, лёд, ещё не родился.
-// Лора в коде нет — он весь в Реестре.
-// Дальше сюда приедет остальное ядро: фильтр лорбуков по эпохе, «кто есть кто», Хронограф.
+// Священный таймлайн — ядро, v0.2.
+// Узнаёт эпоху и дату открытого чата по Реестру мира (лорбук на сервере, имя кончается на «Реестр») и:
+//  • пускает в промпт только лорбуки и записи своей эпохи (книги по эпохам, записи Хроники из будущего — вон);
+//  • правит персону прямо в промпте под эпоху (возраст, «сейчас», внешность) — сама персона в ST не меняется;
+//  • убирает из Закулисья тех, кого в этой эпохе нет: умер, пыль, лёд, ещё не родился.
+// Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const TAG = '[Священный таймлайн]';
+const DEFAULTS = { filterLore: true, persona: true };
 
 const ctx = () => SillyTavern.getContext();
 
-let current = { chatId: null, era: null, date: null, label: null };
+let current = { chatId: null, era: null, explicit: false, date: null, dateSource: '', registry: null };
+let lastLore = null;     // что срезали в последний раз
+let lastPersona = null;  // сколько правок персоны применили в последний раз
+
+function settings() {
+    const ext = ctx().extensionSettings;
+    if (!ext[MODULE]) ext[MODULE] = {};
+    for (const [k, v] of Object.entries(DEFAULTS)) if (ext[MODULE][k] === undefined) ext[MODULE][k] = v;
+    return ext[MODULE];
+}
 
 // ───────────── Реестр ─────────────
 
@@ -22,6 +33,7 @@ export function registryName(names, override) {
 
 async function loadRegistry() {
     const name = registryName(ctx().getWorldInfoNames?.(), ctx().extensionSettings?.[MODULE]?.registry);
+    current.registry = name;
     if (!name) return null;
     try {
         const data = await ctx().loadWorldInfo(name);
@@ -34,6 +46,10 @@ async function loadRegistry() {
 
 function records(data, type) {
     return Object.values(data?.entries || {}).map(e => e?.gc).filter(g => g && g.type === type);
+}
+
+export function worldRecord(data) {
+    return records(data, 'world')[0] || null;
 }
 
 const norm = s => String(s ?? '').trim().toLowerCase().replace(/ё/g, 'е');
@@ -56,10 +72,79 @@ export function findEra(data, { marker, chatId, groupId } = {}) {
     return null;
 }
 
+export function eraById(data, id) {
+    return records(data, 'era').find(x => String(x.id) === String(id)) || null;
+}
+
 /** Дата, на которую смотрим состав эпохи: её начало. */
 export function eraDate(era) {
     return era?.from || era?.to || null;
 }
+
+// ───────────── дата чата ─────────────
+
+const MONTHS = {
+    январ: 1, феврал: 2, март: 3, апрел: 4, ма: 5, июн: 6, июл: 7, август: 8, сентябр: 9, октябр: 10, ноябр: 11, декабр: 12,
+    jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+};
+const pad = n => String(n).padStart(2, '0');
+
+function monthOf(word) {
+    const w = norm(word);
+    if (/^ма[йяе]$/.test(w)) return 5;
+    for (const [k, v] of Object.entries(MONTHS)) if (k !== 'ма' && w.startsWith(k)) return v;
+    return null;
+}
+
+/** «Понедельник, 27 декабря 1943», «27.12.1943», «1943-12-27», «December 27, 1943», «октябрь 1944» → «1943-12-27» / «1944-10». */
+export function parseStoryDate(text) {
+    const s = String(text ?? '');
+    let m = s.match(/(\d{4})-(\d{2})(?:-(\d{2}))?/);
+    if (m) return m[3] ? `${m[1]}-${m[2]}-${m[3]}` : `${m[1]}-${m[2]}`;
+    m = s.match(/\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b/);
+    if (m) return `${m[3]}-${pad(m[2])}-${pad(m[1])}`;
+    m = s.match(/(\d{1,2})\s+([а-яёa-z]+)\.?,?\s+(\d{4})/i);
+    if (m && monthOf(m[2])) return `${m[3]}-${pad(monthOf(m[2]))}-${pad(m[1])}`;
+    m = s.match(/([a-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})/i);
+    if (m && monthOf(m[1])) return `${m[3]}-${pad(monthOf(m[1]))}-${pad(m[2])}`;
+    m = s.match(/([а-яёa-z]+)\s+(\d{4})/i);
+    if (m && monthOf(m[1])) return `${m[2]}-${pad(monthOf(m[1]))}`;
+    return null;
+}
+
+function infoBoxDate(ib) {
+    if (!ib) return null;
+    if (typeof ib === 'object') return ib?.date?.value || null;
+    const m = String(ib).match(/"date"\s*:\s*\{\s*"value"\s*:\s*"([^"]+)"/);
+    return m ? m[1] : null;
+}
+
+/** Где сейчас сюжет: метка в чате → трекер RPG Companion → Horae → ничего. */
+export function storyDate(md, chat) {
+    const mark = md?.[MODULE]?.date;
+    if (mark) return { date: String(mark), source: 'метка чата' };
+    const rc = md?.rpg_companion;
+    for (const box of [rc?.committedTrackerData?.infoBox, rc?.lastGeneratedData?.infoBox]) {
+        const d = parseStoryDate(infoBoxDate(box));
+        if (d) return { date: d, source: 'трекер' };
+    }
+    const list = Array.isArray(chat) ? chat : [];
+    for (let i = list.length - 1; i >= Math.max(0, list.length - 40); i--) {
+        const d = parseStoryDate(list[i]?.horae_meta?.timestamp?.story_date);
+        if (d) return { date: d, source: 'Horae' };
+    }
+    return { date: null, source: '' };
+}
+
+/** Дата не выходит за рамки эпохи (трекеры иногда уползают). */
+export function clampDate(date, era) {
+    if (!date || !era) return date;
+    if (era.from && date < era.from) return era.from;
+    if (era.to && date > era.to) return era.to;
+    return date;
+}
+
+// ───────────── личности ─────────────
 
 /** Личность по имени из ростера: точное имя или алиас, иначе — первое слово («Имя Фамилия» → «Имя»). */
 export function findIdentity(data, name) {
@@ -107,6 +192,110 @@ export function mentionRegex(data, identity, rosterName) {
     return new RegExp(`(^|[^\\p{L}])(${parts.join('|')})(?!\\p{L})`, 'iu');
 }
 
+// ───────────── лорбуки ─────────────
+
+/**
+ * Решение по записи лорбука для эпохи и даты.
+ * Книга со списком эпох — только в них. Запись с gc.eras — только в своих эпохах (gc.inject — ядро её включает).
+ * Запись Хроники, которая начинается позже даты чата, — из будущего, вон.
+ * Возвращает 'keep' | 'drop' | 'enable'.
+ */
+export function judgeEntry(entry, { eraId, date }, books) {
+    const scope = books?.[entry?.world];
+    if (scope && Array.isArray(scope.eras) && !scope.eras.includes(eraId)) return 'drop';
+    const g = entry?.gc;
+    if (!g || typeof g !== 'object') return 'keep';
+    if (Array.isArray(g.eras)) {
+        if (!g.eras.includes(eraId)) return 'drop';
+        if (g.inject && entry.disable) return 'enable';
+    }
+    if (date && g.from && !entry.disable && String(g.from) > date) return 'drop';
+    return 'keep';
+}
+
+export function filterLore(payload, scope, books) {
+    const stats = { dropped: 0, enabled: 0, byBook: {} };
+    for (const key of ['globalLore', 'characterLore', 'chatLore', 'personaLore']) {
+        const arr = payload?.[key];
+        if (!Array.isArray(arr)) continue;
+        for (let i = arr.length - 1; i >= 0; i--) {
+            const verdict = judgeEntry(arr[i], scope, books);
+            if (verdict === 'drop') {
+                if (!arr[i].disable) {
+                    stats.dropped++;
+                    stats.byBook[arr[i].world] = (stats.byBook[arr[i].world] || 0) + 1;
+                }
+                arr.splice(i, 1);
+            } else if (verdict === 'enable') {
+                arr[i].disable = false;
+                stats.enabled++;
+            }
+        }
+    }
+    return stats;
+}
+
+// ───────────── персона ─────────────
+
+/** Правки персоны эпохи — внутри текста персоны в промпте. Возвращает число применённых правок. */
+export function patchPersona(messages, description, patches) {
+    const desc = String(description || '').trim();
+    if (!desc || !Array.isArray(patches) || !patches.length) return 0;
+    let fixed = desc;
+    let n = 0;
+    for (const p of patches) {
+        if (p?.find && fixed.includes(p.find)) {
+            fixed = fixed.split(p.find).join(p.replace ?? '');
+            n++;
+        }
+    }
+    if (!n) return 0;
+    let hit = false;
+    for (const m of messages || []) {
+        if (typeof m?.content === 'string' && m.content.includes(desc)) {
+            m.content = m.content.split(desc).join(fixed);
+            hit = true;
+        } else if (Array.isArray(m?.content)) {
+            for (const part of m.content) {
+                if (typeof part?.text === 'string' && part.text.includes(desc)) {
+                    part.text = part.text.split(desc).join(fixed);
+                    hit = true;
+                }
+            }
+        }
+    }
+    return hit ? n : 0;
+}
+
+// ───────────── состояние чата ─────────────
+
+/** Эпоха и дата открытого чата. explicit — эпоха отмечена в Реестре, а не взята по умолчанию. */
+async function resolve() {
+    const c = ctx();
+    const chatId = c.getCurrentChatId?.() || null;
+    const data = await loadRegistry();
+    const md = c.chatMetadata;
+    let era = null;
+    let explicit = false;
+    if (data && chatId) {
+        era = findEra(data, { marker: md?.[MODULE]?.era, chatId, groupId: c.groupId });
+        explicit = !!era;
+        if (!era) era = eraById(data, worldRecord(data)?.defaultEra);
+    }
+    let date = null;
+    let dateSource = '';
+    if (era) {
+        const sd = storyDate(md, c.chat);
+        date = clampDate(sd.date, era);
+        dateSource = sd.source;
+        if (!date && era.to) { date = era.from; dateSource = 'начало эпохи'; }
+    }
+    current = { chatId, era, explicit, date, dateSource, registry: current.registry };
+    return { data, era, explicit, date, md };
+}
+
+// ───────────── Закулисье ─────────────
+
 /** Закомментировать в ростере Закулисья тех, кого нет на дату. Уже убранные раньше (skip) не трогаем. */
 export function pruneRoster(text, data, date, skip = [], label = '') {
     const removed = [];
@@ -123,14 +312,11 @@ export function pruneRoster(text, data, date, skip = [], label = '') {
     return { text: out.join('\n'), removed };
 }
 
-// ───────────── Закулисье ─────────────
-
-async function guardBackstage(data, era, md) {
+async function guardBackstage(data, era, date, md) {
     const bs = md?.backstage;
     if (!bs || typeof bs.roster !== 'string') return [];
     const done = Array.isArray(md[MODULE]?.backstagePruned) ? md[MODULE].backstagePruned : [];
-    const date = eraDate(era);
-    const { text, removed } = pruneRoster(bs.roster, data, date, done, era.id);
+    const { text, removed } = pruneRoster(bs.roster, data, date || eraDate(era), done, era.id);
     if (!removed.length) return [];
 
     bs.roster = text;
@@ -146,32 +332,126 @@ async function guardBackstage(data, era, md) {
     return removed;
 }
 
-// ───────────── чат ─────────────
-
-async function onChatChanged() {
+async function onChatChanged({ reset = true } = {}) {
     const chatId = ctx().getCurrentChatId?.();
-    current = { chatId: chatId || null, era: null, date: null, label: null };
-    if (!chatId) return;
-    const data = await loadRegistry();
-    if (!data || ctx().getCurrentChatId?.() !== chatId) return; // чат сменился, пока читали Реестр
-    const md = ctx().chatMetadata;
-    const era = findEra(data, { marker: md?.[MODULE]?.era, chatId, groupId: ctx().groupId });
-    if (!era) return;
-    current = { chatId, era: era.id, date: eraDate(era), label: era.label || '' };
-
-    const removed = await guardBackstage(data, era, md);
+    if (reset) {
+        lastLore = null;
+        lastPersona = null;
+    }
+    const { data, era, explicit, date, md } = await resolve();
+    renderStatus();
+    if (!data || !era || !explicit || ctx().getCurrentChatId?.() !== chatId) return;
+    const removed = await guardBackstage(data, era, date, md);
     if (removed.length) {
         const who = removed.map(r => r.id.name || r.name).join(', ');
         const msg = `Эпоха ${era.id}: убрала из Закулисья — ${who}. Их нет в этом времени.`;
         console.log(TAG, msg);
         try { window.toastr?.info(msg, 'Священный таймлайн', { timeOut: 9000 }); } catch { /* ignore */ }
+        renderStatus();
     }
+}
+
+async function onEntriesLoaded(payload) {
+    try {
+        if (!settings().filterLore) return;
+        const { data, era, date } = await resolve();
+        if (!data || !era) return;
+        lastLore = filterLore(payload, { eraId: era.id, date }, worldRecord(data)?.books || {});
+        renderStatus();
+    } catch (e) {
+        console.warn(TAG, 'фильтр лорбуков пропущен', e);
+    }
+}
+
+async function onPromptReady(event) {
+    try {
+        if (!settings().persona || !event?.chat) return;
+        const { era } = await resolve();
+        if (!era) return;
+        const desc = ctx().powerUserSettings?.persona_description;
+        lastPersona = patchPersona(event.chat, desc, era.personaPatches);
+        renderStatus();
+    } catch (e) {
+        console.warn(TAG, 'персона не поправлена', e);
+    }
+}
+
+// ───────────── интерфейс ─────────────
+
+function esc(s) {
+    return String(s ?? '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+}
+
+function fmtDate(d) {
+    const m = String(d || '').match(/^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?/);
+    if (!m) return d || '';
+    return [m[3], m[2], m[1]].filter(Boolean).join('.');
+}
+
+function statusLines() {
+    const out = [];
+    out.push(current.registry ? `Реестр: «${esc(current.registry)}»` : 'Реестр не найден — нужен лорбук с именем на «Реестр».');
+    if (!current.chatId) {
+        out.push('Чат не открыт.');
+        return out;
+    }
+    if (!current.era) {
+        out.push('Эпоха: в Реестре не отмечена.');
+        return out;
+    }
+    const how = current.explicit ? '' : ' (по умолчанию — чат в Реестре не отмечен)';
+    out.push(`Эпоха: <b>${esc(current.era.id)}</b> — ${esc(current.era.label || '')}${how}`);
+    out.push(current.date ? `Дата сюжета: ${esc(fmtDate(current.date))}${current.dateSource ? ` (${esc(current.dateSource)})` : ''}` : 'Дата сюжета: не видна — лорбуки по датам не режу.');
+    const pruned = ctx().chatMetadata?.[MODULE]?.backstagePruned;
+    if (Array.isArray(pruned) && pruned.length) out.push(`Закулисье: убраны ${esc(pruned.join(', '))}`);
+    if (lastLore) {
+        const books = Object.entries(lastLore.byBook).map(([b, n]) => `${esc(b)}: ${n}`).join('; ');
+        out.push(`Лорбуки: скрыто ${lastLore.dropped}${books ? ` (${books})` : ''}${lastLore.enabled ? `, включено срезов эпохи: ${lastLore.enabled}` : ''}`);
+    } else {
+        out.push('Лорбуки: покажу после первой генерации.');
+    }
+    if (lastPersona !== null) out.push(lastPersona ? `Персона: срез эпохи — правок ${lastPersona}` : 'Персона: без правок');
+    return out;
+}
+
+function renderStatus() {
+    if (typeof $ !== 'function') return;
+    $('#sacred_timeline_status').html(statusLines().map(l => `<div>${l}</div>`).join(''));
+}
+
+function renderSettings() {
+    if (typeof $ !== 'function' || !$('#extensions_settings2').length) return;
+    const s = settings();
+    const html = `
+    <div class="sacred-timeline-settings">
+      <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+          <b>Священный таймлайн</b>
+          <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+          <div id="sacred_timeline_status" class="sacred-timeline-status"></div>
+          <label class="checkbox_label"><input type="checkbox" id="sacred_timeline_lore" ${s.filterLore ? 'checked' : ''}>
+            <span>Лорбуки по эпохе чата</span></label>
+          <label class="checkbox_label"><input type="checkbox" id="sacred_timeline_persona" ${s.persona ? 'checked' : ''}>
+            <span>Персона по эпохе чата</span></label>
+          <div class="menu_button" id="sacred_timeline_check">Проверить этот чат</div>
+          <small>v${VERSION} · /era — эпоха чата</small>
+        </div>
+      </div>
+    </div>`;
+    $('#extensions_settings2').append(html);
+    $('#sacred_timeline_lore').on('change', function () { settings().filterLore = this.checked; ctx().saveSettingsDebounced(); });
+    $('#sacred_timeline_persona').on('change', function () { settings().persona = this.checked; ctx().saveSettingsDebounced(); });
+    $('#sacred_timeline_check').on('click', () => { onChatChanged({ reset: false }).catch(e => console.warn(TAG, e)); });
+    renderStatus();
 }
 
 function eraReport() {
     if (!current.chatId) return 'Чат не открыт.';
     if (!current.era) return 'Эпоха этого чата в Реестре не отмечена.';
-    return `Эпоха ${current.era} — ${current.label} (с ${current.date}).`;
+    const date = current.date ? `, сюжет — ${fmtDate(current.date)}` : '';
+    return `Эпоха ${current.era.id} — ${current.era.label || ''}${current.explicit ? '' : ' (по умолчанию)'}${date}.`;
 }
 
 function registerSlash() {
@@ -179,8 +459,9 @@ function registerSlash() {
         const { SlashCommandParser, SlashCommand } = ctx();
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             name: 'era',
-            helpString: 'Священный таймлайн: какая эпоха у этого чата.',
+            helpString: 'Священный таймлайн: какая эпоха и дата у этого чата.',
             callback: async () => {
+                await resolve();
                 const text = eraReport();
                 try { window.toastr?.info(text, 'Священный таймлайн'); } catch { /* ignore */ }
                 return text;
@@ -193,10 +474,16 @@ function registerSlash() {
 
 if (typeof jQuery === 'function') {
     jQuery(async () => {
+        settings();
+        renderSettings();
         const { eventSource, eventTypes } = ctx();
-        eventSource.on(eventTypes.CHAT_CHANGED, () => { onChatChanged().catch(e => console.warn(TAG, e)); });
+        const safe = fn => (...a) => { Promise.resolve(fn(...a)).catch(e => console.warn(TAG, e)); };
+        eventSource.on(eventTypes.CHAT_CHANGED, safe(onChatChanged));
         // Закулисье заводит состав лениво и обновляет повестки после сообщений — проверяем и тут
-        eventSource.on(eventTypes.MESSAGE_RECEIVED, () => { onChatChanged().catch(e => console.warn(TAG, e)); });
+        eventSource.on(eventTypes.MESSAGE_RECEIVED, safe(() => onChatChanged({ reset: false })));
+        // эти два ST ждёт — правки успевают попасть в промпт
+        eventSource.on(eventTypes.WORLDINFO_ENTRIES_LOADED, onEntriesLoaded);
+        eventSource.on(eventTypes.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
         registerSlash();
         window.SacredTimeline = {
             version: VERSION,
