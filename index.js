@@ -566,7 +566,8 @@ async function resolve() {
 // Ядро не лезет в настройки чужих расширок. Три рычага:
 //  • context() + событие «sacred-timeline:changed» — свои расширки сами подстраиваются под эпоху и облик;
 //  • режимы расширок по эпохам в Реестре (gc.type "ext" — каталог, era.ext — режимы): off — промпт расширки
-//    глушится и её кнопки прячутся в чатах эпохи, quiet — только промпт, hidden — только кнопки;
+//    глушится, кнопки прячутся, а главный выключатель (gate в каталоге) расширка видит закрытым; quiet — только
+//    промпт, hidden — только кнопки;
 //  • body[data-st-era] / [data-st-year] — темы и CSS могут смотреть на эпоху без кода.
 
 /** Обличье по id обличья: { identity, slice }. */
@@ -636,6 +637,45 @@ export function guardPrompts(store, keys, isMuted) {
     return armed;
 }
 
+const GATE = Symbol.for('sacredTimeline.gate');
+
+/**
+ * Заслонка на главный выключатель расширки (поле её настроек, например isEnabled): пока эпоха расширку
+ * выключает, та читает false и ничего не делает (не считает, не кидает кубики, не шлёт тосты). Настоящее значение
+ * хранится и уходит в сохранение настроек (toJSON) — в файле настроек ничего не меняется. Поле, которого ещё нет,
+ * не трогаем.
+ */
+export function gateSetting(obj, key, isClosed) {
+    if (!obj || typeof obj !== 'object' || !key) return false;
+    const d = Object.getOwnPropertyDescriptor(obj, key);
+    if (!d || d.get || d.set || !d.configurable) return false;
+    let value = d.value;
+    const get = () => (isClosed() ? false : value);
+    get[GATE] = () => value;
+    Object.defineProperty(obj, key, { configurable: true, enumerable: true, get, set: v => { value = v; } });
+    if (!Object.prototype.hasOwnProperty.call(obj, 'toJSON')) {
+        Object.defineProperty(obj, 'toJSON', {
+            configurable: true, enumerable: false, writable: true,
+            value: function () {
+                const out = {};
+                for (const k of Object.keys(this)) {
+                    const dd = Object.getOwnPropertyDescriptor(this, k);
+                    out[k] = dd?.get?.[GATE] ? dd.get[GATE]() : this[k];
+                }
+                return out;
+            },
+        });
+    }
+    return true;
+}
+
+/** Заслонки из каталога: [{ id, settings, key }] — у расширок с главным выключателем (gate). */
+export function catalogGates(data) {
+    return records(data, 'ext')
+        .filter(x => x.id && x.gate && x.gate.settings && x.gate.key)
+        .map(x => ({ id: x.id, settings: String(x.gate.settings), key: String(x.gate.key) }));
+}
+
 const cssAttr = s => String(s).replace(/["\\]/g, '\\$&');
 
 /** CSS, который прячет кнопки расширок в эпохах, где они выключены. */
@@ -687,13 +727,17 @@ let lastContext = null;
 let lastContextJson = '';
 let muted = new Set();
 let guardKeys = [];
+let closed = new Set();   // расширки, выключенные в эпохе (режим off) — для заслонок
+let gates = [];
 
-/** Охрана промптов: на все ключи каталога (новые ключи расширки заводят по ходу — зовётся перед каждой генерацией). */
+/** Охрана промптов и заслонки: на всё из каталога (расширки заводят ключи по ходу — зовётся перед каждой генерацией). */
 function armGuard() {
     try {
-        const store = ctx().extensionPrompts;
+        const c = ctx();
+        const store = c.extensionPrompts;
         if (store && guardKeys.length) guardPrompts(store, guardKeys, key => muted.has(key));
-    } catch (e) { console.warn(TAG, 'охрана промптов не встала', e); }
+        for (const g of gates) gateSetting(c.extensionSettings?.[g.settings], g.key, () => closed.has(g.id));
+    } catch (e) { console.warn(TAG, 'охрана расширок не встала', e); }
 }
 
 function applyPolicyCss(data) {
@@ -726,7 +770,9 @@ async function publish(data) {
     if (data === undefined) data = await loadRegistry();
     const cx = buildContext(data, current, ctx());
     muted = cx ? mutedKeys(data, cx.ext) : new Set();
+    closed = new Set(cx ? Object.entries(cx.ext).filter(([, mode]) => mode === 'off').map(([id]) => id) : []);
     guardKeys = data ? catalogKeys(data) : [];
+    gates = data ? catalogGates(data) : [];
     armGuard();
     applyPolicyCss(data);
     applyBodyAttrs(cx);
