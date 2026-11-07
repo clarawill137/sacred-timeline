@@ -1,12 +1,13 @@
 // Священный таймлайн — ядро, v0.2.
 // Узнаёт эпоху и дату открытого чата по Реестру мира (лорбук на сервере, имя кончается на «Реестр») и:
 //  • пускает в промпт только лорбуки и записи своей эпохи (книги по эпохам, записи Хроники из будущего — вон);
+//  • тайны — только тем, кто их знает (gc.knows говорящего на дату), и не раньше, чем персона их прожила (gc.personal);
 //  • правит персону прямо в промпте под эпоху (возраст, «сейчас», внешность) — сама персона в ST не меняется;
 //  • убирает из Закулисья тех, кого в этой эпохе нет: умер, пыль, лёд, ещё не родился.
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true };
 
@@ -96,7 +97,7 @@ function monthOf(word) {
     return null;
 }
 
-/** «Понедельник, 27 декабря 1943», «27.12.1943», «1943-12-27», «December 27, 1943», «октябрь 1944» → «1943-12-27» / «1944-10». */
+/** «Среда, 15 марта 1961», «15.03.1961», «1961-03-15», «March 15, 1961», «октябрь 1962» → «1961-03-15» / «1962-10». */
 export function parseStoryDate(text) {
     const s = String(text ?? '');
     let m = s.match(/(\d{4})-(\d{2})(?:-(\d{2}))?/);
@@ -119,7 +120,7 @@ function infoBoxDate(ib) {
     return m ? m[1] : null;
 }
 
-/** Где сейчас сюжет: метка в чате → трекер RPG Companion → Horae → ничего. */
+/** Где сейчас сюжет: метка в чате → трекер RPG Companion → трекер в тексте ответа → Horae → ничего. */
 export function storyDate(md, chat) {
     const mark = md?.[MODULE]?.date;
     if (mark) return { date: String(mark), source: 'метка чата' };
@@ -130,7 +131,14 @@ export function storyDate(md, chat) {
     }
     const list = Array.isArray(chat) ? chat : [];
     for (let i = list.length - 1; i >= Math.max(0, list.length - 40); i--) {
-        const d = parseStoryDate(list[i]?.horae_meta?.timestamp?.story_date);
+        const msg = list[i];
+        const sw = msg?.extra?.rpg_companion_swipes;
+        const box = sw && (sw[String(msg.swipe_id ?? 0)] || sw['0'])?.infoBox;
+        let d = parseStoryDate(infoBoxDate(box));
+        if (d) return { date: d, source: 'трекер' };
+        d = parseStoryDate(infoBoxDate(msg?.mes));
+        if (d) return { date: d, source: 'трекер в ответе' };
+        d = parseStoryDate(msg?.horae_meta?.timestamp?.story_date);
         if (d) return { date: d, source: 'Horae' };
     }
     return { date: null, source: '' };
@@ -194,13 +202,19 @@ export function mentionRegex(data, identity, rosterName) {
 
 // ───────────── лорбуки ─────────────
 
+const covers = (s, at) => (s.from == null || s.from <= at) && (s.to == null || at < s.to);
+
 /**
  * Решение по записи лорбука для эпохи и даты.
  * Книга со списком эпох — только в них. Запись с gc.eras — только в своих эпохах (gc.inject — ядро её включает).
  * Запись Хроники, которая начинается позже даты чата, — из будущего, вон.
+ * Тайна с картой знания (gc.knows) — только если говорящий знает её на эту дату; «обрывки» — не знание;
+ * говорящий не опознан — тайну не даём (кому она известна, записано явно, а его в списке нет).
+ * Без карты знания: событие из личного времени персоны (gc.personal) позже её «сейчас» в этой эпохе — она его
+ * ещё не прожила, вон. Карта знания важнее: если говорящий знает, а персона ещё нет — это петля, ему можно.
  * Возвращает 'keep' | 'drop' | 'enable'.
  */
-export function judgeEntry(entry, { eraId, date }, books) {
+export function judgeEntry(entry, { eraId, date, eraFrom, speaker, personaId, personaNow }, books) {
     const scope = books?.[entry?.world];
     if (scope && Array.isArray(scope.eras) && !scope.eras.includes(eraId)) return 'drop';
     const g = entry?.gc;
@@ -209,7 +223,15 @@ export function judgeEntry(entry, { eraId, date }, books) {
         if (!g.eras.includes(eraId)) return 'drop';
         if (g.inject && entry.disable) return 'enable';
     }
-    if (date && g.from && !entry.disable && String(g.from) > date) return 'drop';
+    if (entry.disable) return 'keep';
+    if (date && g.from && String(g.from) > date) return 'drop';
+    if (g.secret && g.knows && typeof g.knows === 'object') {
+        const at = date || eraFrom;
+        const spans = speaker ? g.knows[speaker] : null;
+        return at && Array.isArray(spans) && spans.some(s => s.mode === 'knows' && covers(s, at)) ? 'keep' : 'drop';
+    }
+    const lived = personaId && g.personal?.[personaId];
+    if (lived && personaNow && String(lived).split('/')[0] > personaNow) return 'drop';
     return 'keep';
 }
 
@@ -265,6 +287,23 @@ export function patchPersona(messages, description, patches) {
         }
     }
     return hit ? n : 0;
+}
+
+// ───────────── кто говорит ─────────────
+
+/** Личность говорящего: по аватару карточки (обличья Реестра знают свои карточки), иначе по имени. */
+export function speakerOf(data, character, fallbackName) {
+    const avatar = character?.avatar;
+    if (avatar) {
+        const hit = records(data, 'identity').find(g => (g.slices || []).some(s => s.card === avatar));
+        if (hit) return hit.id;
+    }
+    return findIdentity(data, character?.name || fallbackName)?.id || null;
+}
+
+/** Персона пользователя в Реестре — личность с полем persona. */
+export function personaIdentity(data) {
+    return records(data, 'identity').find(g => g.persona)?.id || null;
 }
 
 // ───────────── состояние чата ─────────────
@@ -356,7 +395,17 @@ async function onEntriesLoaded(payload) {
         if (!settings().filterLore) return;
         const { data, era, date } = await resolve();
         if (!data || !era) return;
-        lastLore = filterLore(payload, { eraId: era.id, date }, worldRecord(data)?.books || {});
+        const c = ctx();
+        const scope = {
+            eraId: era.id,
+            date,
+            eraFrom: era.from || null,
+            speaker: speakerOf(data, c.characters?.[c.characterId], c.name2),
+            personaId: personaIdentity(data),
+            personaNow: era.personaTime || date || era.from || null,
+        };
+        lastLore = filterLore(payload, scope, worldRecord(data)?.books || {});
+        lastLore.speaker = scope.speaker ? (records(data, 'identity').find(g => g.id === scope.speaker)?.name || scope.speaker) : null;
         renderStatus();
     } catch (e) {
         console.warn(TAG, 'фильтр лорбуков пропущен', e);
@@ -390,7 +439,8 @@ function fmtDate(d) {
 
 function statusLines() {
     const out = [];
-    out.push(current.registry ? `Реестр: «${esc(current.registry)}»` : 'Реестр не найден — нужен лорбук с именем на «Реестр».');
+    const reg = current.registry || registryName(ctx().getWorldInfoNames?.(), ctx().extensionSettings?.[MODULE]?.registry);
+    out.push(reg ? `Реестр: «${esc(reg)}»` : 'Реестр не найден — нужен лорбук с именем на «Реестр».');
     if (!current.chatId) {
         out.push('Чат не открыт.');
         return out;
@@ -406,7 +456,7 @@ function statusLines() {
     if (Array.isArray(pruned) && pruned.length) out.push(`Закулисье: убраны ${esc(pruned.join(', '))}`);
     if (lastLore) {
         const books = Object.entries(lastLore.byBook).map(([b, n]) => `${esc(b)}: ${n}`).join('; ');
-        out.push(`Лорбуки: скрыто ${lastLore.dropped}${books ? ` (${books})` : ''}${lastLore.enabled ? `, включено срезов эпохи: ${lastLore.enabled}` : ''}`);
+        out.push(`Лорбуки: скрыто ${lastLore.dropped}${books ? ` (${books})` : ''}${lastLore.enabled ? `, включено срезов эпохи: ${lastLore.enabled}` : ''} · говорящий: ${lastLore.speaker ? esc(lastLore.speaker) : 'не опознан — тайны скрыты'}`);
     } else {
         out.push('Лорбуки: покажу после первой генерации.');
     }
