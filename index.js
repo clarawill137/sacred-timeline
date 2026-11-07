@@ -13,10 +13,12 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.8.0';
+const VERSION = '0.8.1';
 const TAG = '[Священный таймлайн]';
-const DEFAULTS = { filterLore: true, persona: true, who: true };
+const DEFAULTS = { filterLore: true, persona: true, who: true, chronicle: true };
 const WHO_KEY = 'sacred_timeline_who';
+const CHRON_KEY = 'sacred_timeline_chronicle';
+const IN_PROMPT = 0;     // extension_prompt_types.IN_PROMPT
 const WHO_DEPTH = 1;     // перед последним сообщением чата
 const IN_CHAT = 1;       // extension_prompt_types.IN_CHAT
 const ROLE_SYSTEM = 0;   // extension_prompt_roles.SYSTEM
@@ -31,6 +33,7 @@ let lastBooks = null;    // книги эпохи: { added: [имена], missin
 let lastAvatar = null;   // аватар персоны: { avatar, base, missing, switched }
 let lastMemory = null;   // память эпохи: { book, bound, missing, other }
 let lastHistory = null;  // память прошлых эпох в промпте: { added: [книги], entries: n }
+let lastChron = null;    // Хроника под дату: { past, ahead } — сколько строк ушло
 let switchingPersona = false;
 
 function settings() {
@@ -574,6 +577,75 @@ async function syncPersonaAvatar(data, era, explicit) {
     }
 }
 
+// ───────────── Хроника под дату ─────────────
+
+const CHRON_KINDS = ['fixed', 'event', 'arc', 'state'];
+const CHRON_SYM = { fixed: '◆', event: '●', arc: '▬', state: '▬' };
+
+/** ★ХРОНОЛОГИЯ (legacy → render:chronicle) живёт в этой эпохе? Тогда сводку не собираем — не дублируем. */
+export function legacyChronicleActive(book, eraId) {
+    return Object.values(book?.entries || {}).some(e => e?.gc?.kind === 'legacy' && !e.disable
+        && (e.gc.replacedBy || []).includes('render:chronicle') && (!Array.isArray(e.gc.eras) || e.gc.eras.includes(String(eraId))));
+}
+
+/**
+ * Хроника под дату — вместо ★ХРОНОЛОГИИ. Прошлое: события, отрезки и фиксированные точки до даты сюжета, только
+ * видимые говорящему (дата, знание); состояние — только пока длится; далёкое — сводкой родителя (подсобытия
+ * закрытых до эпохи отрезков не дублируем). Впереди: ближайшие фиксированные точки — режиссёрской пометкой «не
+ * ломать», персонажи о них не знают.
+ */
+export function chronicleBlock(book, scope, books, { world, eraFrom, ahead = 4, maxPast = 40 } = {}) {
+    const at = scope?.date || scope?.eraFrom;
+    const out = { text: '', past: 0, ahead: 0 };
+    if (!book?.entries || !at) return out;
+    const all = Object.entries(book.entries)
+        .map(([k, e]) => ({ ...e, uid: e?.uid ?? Number(k) }))
+        .filter(e => e && CHRON_KINDS.includes(e.gc?.kind) && e.gc.from && (!e.gc.status || e.gc.status === 'canon'));
+    const byUid = new Map(all.map(e => [Number(e.uid), e]));
+    const line = e => {
+        const t = String(e.comment || '').trim();
+        return /^[◆●▬▭■]/.test(t) ? t : `${CHRON_SYM[e.gc.kind] || '•'} ${t}`;
+    };
+    const from = String(eraFrom || at);
+    const sp = scope?.speaker || null;
+    const memo = new Map();
+    // кто что знает: мировые фиксированные точки и public — всем; личная история — участникам (who) и тем, кому
+    // известно (knows); рассказчику — всё несекретное; подсобытия тайного отрезка — только если виден сам отрезок
+    const knowsAt = (g) => !!sp && Array.isArray(g?.knows?.[sp]) && g.knows[sp].some(s => s.mode === 'knows' && covers(s, at));
+    const visible = (e) => {
+        const id = Number(e.uid);
+        if (memo.has(id)) return memo.get(id);
+        const g = e.gc;
+        const open = g.kind === 'fixed' || g.public;
+        let ok = judgeEntry({ ...e, world, disable: false }, scope, books) !== 'drop';
+        if (ok && !open && g.parent != null) {
+            const p = byUid.get(Number(g.parent));
+            if (p?.gc?.secret && !knowsAt(p.gc)) ok = false;   // подсобытие тайного отрезка — тайна и само
+        }
+        if (ok && !open) ok = sp ? ((g.who || []).includes(sp) || knowsAt(g)) : !g.secret;
+        memo.set(id, ok);
+        return ok;
+    };
+    const seen = all.filter(e => String(e.gc.from) <= at
+        && !(e.gc.kind === 'state' && e.gc.to && !(at < String(e.gc.to)))
+        && visible(e));
+    const keep = new Set(seen);
+    const past = seen.filter(e => {
+        const p = e.gc.parent != null ? byUid.get(Number(e.gc.parent)) : null;
+        return !(p && keep.has(p) && p.gc.to && String(p.gc.to) <= from);   // далёкий отрезок — одной строкой родителя
+    }).sort((a, b) => String(a.gc.from).localeCompare(String(b.gc.from)));
+    const tail = past.slice(-maxPast);
+    const next = all.filter(e => e.gc.kind === 'fixed' && String(e.gc.from) > at)
+        .sort((a, b) => String(a.gc.from).localeCompare(String(b.gc.from))).slice(0, ahead);
+    const parts = [];
+    if (tail.length) parts.push(`[Хроника мира — что было до ${fmtDate(at)} и что из этого известно говорящему]\n` + tail.map(line).join('\n'));
+    if (next.length) parts.push('[Режиссёру, не знание персонажей: впереди фиксированные точки — сюжет к ним придёт, ломать нельзя, персонажи о них не знают]\n' + next.map(line).join('\n'));
+    out.text = parts.join('\n\n');
+    out.past = tail.length;
+    out.ahead = next.length;
+    return out;
+}
+
 // ───────────── кто есть кто ─────────────
 
 /** Строки эпохи на дату: у строки бывают from/to (как у записей Хроники) и speaker — только на его ходу. */
@@ -1103,7 +1175,9 @@ async function onChatChanged({ reset = true } = {}) {
         lastAvatar = null;
         lastMemory = null;
         lastHistory = null;
+        lastChron = null;
         ctx().setExtensionPrompt?.(WHO_KEY, '', IN_CHAT, WHO_DEPTH, false, ROLE_SYSTEM);
+        ctx().setExtensionPrompt?.(CHRON_KEY, '', IN_PROMPT, 0, false, ROLE_SYSTEM);
     }
     const { data, era, explicit, date, md } = await resolve();
     if (reset && ctx().getCurrentChatId?.() === chatId) {
@@ -1178,6 +1252,24 @@ async function onGenerationStarted() {
         renderStatus();
     } catch (e) {
         console.warn(TAG, '«кто есть кто» пропущен', e);
+    }
+    try {
+        let text = '';
+        lastChron = null;
+        const { data, era, explicit, date } = r;
+        const w = data ? worldRecord(data) : null;
+        if (settings().chronicle && data && era && explicit && w?.chronicle) {
+            const book = await ctx().loadWorldInfo?.(w.chronicle);
+            if (book?.entries && !legacyChronicleActive(book, era.id)) {
+                const res = chronicleBlock(book, scopeFor(data, era, date, ctx()), w.books || {}, { world: w.chronicle, eraFrom: era.from });
+                text = res.text;
+                lastChron = { past: res.past, ahead: res.ahead };
+            }
+        }
+        ctx().setExtensionPrompt(CHRON_KEY, text, IN_PROMPT, 0, false, ROLE_SYSTEM);
+        renderStatus();
+    } catch (e) {
+        console.warn(TAG, 'Хроника под дату пропущена', e);
     }
 }
 
@@ -1261,6 +1353,8 @@ function statusLines() {
         else if (!lastMemory.canon) out.push(`Память эпохи — «${esc(lastMemory.book)}» (этот чат не каноничный — книгу не ставлю)`);
     }
     if (lastHistory?.added?.length) out.push(`Память прошлых эпох: ${esc(lastHistory.added.join(', '))} — записей ${lastHistory.entries} (дальше — по дате и кто знает)`);
+    if (!settings().chronicle) out.push('Хроника под дату: выключено');
+    else if (lastChron) out.push(`Хроника под дату: прошлое — ${lastChron.past} ${plural(lastChron.past, 'строка', 'строки', 'строк')}, впереди фиксированных точек — ${lastChron.ahead} (режиссёру)`);
     if (!settings().who) out.push('Кто есть кто: выключено');
     else if (lastWho !== null) out.push(lastWho ? `Кто есть кто: ${lastWho} ${plural(lastWho, 'строка', 'строки', 'строк')} в промпте` : 'Кто есть кто: для этой эпохи нет');
     return out;
@@ -1289,6 +1383,8 @@ function renderSettings() {
             <span>Персона по эпохе чата</span></label>
           <label class="checkbox_label"><input type="checkbox" id="sacred_timeline_who" ${s.who ? 'checked' : ''}>
             <span>«Кто есть кто» в промпте</span></label>
+          <label class="checkbox_label"><input type="checkbox" id="sacred_timeline_chron" ${s.chronicle ? 'checked' : ''}>
+            <span>Хроника под дату и фиксированные точки впереди</span></label>
           <div class="menu_button" id="sacred_timeline_check">Проверить этот чат</div>
           <small>v${VERSION} · /era — эпоха чата</small>
         </div>
@@ -1300,6 +1396,12 @@ function renderSettings() {
     $('#sacred_timeline_who').on('change', function () {
         settings().who = this.checked;
         if (!this.checked) ctx().setExtensionPrompt?.(WHO_KEY, '', IN_CHAT, WHO_DEPTH, false, ROLE_SYSTEM);
+        ctx().saveSettingsDebounced();
+        renderStatus();
+    });
+    $('#sacred_timeline_chron').on('change', function () {
+        settings().chronicle = this.checked;
+        if (!this.checked) ctx().setExtensionPrompt?.(CHRON_KEY, '', IN_PROMPT, 0, false, ROLE_SYSTEM);
         ctx().saveSettingsDebounced();
         renderStatus();
     });
