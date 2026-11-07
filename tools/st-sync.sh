@@ -5,9 +5,11 @@
 #   st-sync         — снимок сервера → забрать правки Claude → показать → применить
 #   st-sync undo    — откатить последнее применение (свежие записи STMB не трогает)
 #   st-sync status  — что сейчас происходит
+#   st-sync update  — обновить сам st-sync с GitHub
 #
 # Синкаются только: worlds/*.json, OpenAI Settings/*.json, groups/*.json, characters/*.png.
-# Чаты, бэкапы, settings.json и secrets.json (там ключи API) никогда не уезжают.
+# Из settings.json уезжает только выжимка (_export/settings-safe.json): персоны, привязки
+# лорбуков, теги. Чаты, бэкапы, ключи API (secrets.json, токены расширений) никогда не уезжают.
 
 set -Eeuo pipefail
 trap 'printf "❌ Сбой в строке %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
@@ -21,6 +23,8 @@ HOST_ALIAS="github-st-data"
 REMOTE="${ST_SYNC_REMOTE:-git@${HOST_ALIAS}:${REPO}.git}"
 BRANCH="main"
 SPECS=("worlds|*.json" "OpenAI Settings|*.json" "groups|*.json" "characters|*.png")
+EXPORT_DIR="_export"   # только для чтения Claude; на сервер никогда не применяется
+SELF_URL="https://raw.githubusercontent.com/clarawill137/sacred-timeline/main/tools/st-sync.sh"
 MAX_BYTES=$((90 * 1024 * 1024))   # GitHub не берёт файлы больше 100 МБ
 FAKE="${ST_SYNC_FAKE_ROOT:-}"     # только для тестов: папка вместо контейнера
 YES="${ST_SYNC_YES:-}"
@@ -161,12 +165,47 @@ snapshot() { # $1 — текст коммита
     mkdir -p "$MIRROR/$dir"
     cp -a "$TMPD/new/$dir/." "$MIRROR/$dir/"
   done
+  export_settings
   rm -rf "$TMPD"; TMPD=""
 
   g add -A -- "${DIRS[@]}"
+  if [[ -e "$MIRROR/$EXPORT_DIR" ]]; then g add -A -- "$EXPORT_DIR"; fi
   if ! g diff --cached --quiet; then
     g commit -q -m "$msg"
     return 0
+  fi
+  return 0
+}
+
+# безопасная выжимка settings.json: персоны, привязки лорбуков, теги — без ключей и токенов
+export_settings() {
+  command -v python3 >/dev/null || { warn "Нет python3 — персоны не выгружаю."; return 0; }
+  mkdir -p "$TMPD/raw" "$TMPD/export"
+  if ! ct_fetch "$TMPD/raw" settings.json 2>/dev/null || [[ ! -f "$TMPD/raw/settings.json" ]]; then
+    warn "Не вышло прочитать settings.json — персоны не выгружаю."; return 0
+  fi
+  if python3 - "$TMPD/raw/settings.json" "$TMPD/export/settings-safe.json" <<'PYEOF'
+import json, sys
+s = json.load(open(sys.argv[1], encoding='utf-8'))
+pu = s.get('power_user') or {}
+wi = (s.get('world_info_settings') or {}).get('world_info') or {}
+out = {
+    'personas': pu.get('personas', {}),
+    'persona_descriptions': pu.get('persona_descriptions', {}),
+    'default_persona': pu.get('default_persona'),
+    'world_info': {'globalSelect': wi.get('globalSelect', []), 'charLore': wi.get('charLore', [])},
+    'tags': s.get('tags', []),
+    'tag_map': s.get('tag_map', {}),
+    'extensions': sorted((s.get('extension_settings') or {}).keys()),
+}
+open(sys.argv[2], 'w', encoding='utf-8').write(json.dumps(out, ensure_ascii=False, indent=2) + '\n')
+PYEOF
+  then
+    rm -rf -- "${MIRROR:?}/$EXPORT_DIR"
+    mkdir -p "$MIRROR/$EXPORT_DIR"
+    cp -- "$TMPD/export/settings-safe.json" "$MIRROR/$EXPORT_DIR/"
+  else
+    warn "Персоны не выгрузились."
   fi
   return 0
 }
@@ -388,6 +427,18 @@ cmd_status() {
   return 0
 }
 
+cmd_update() {
+  command -v curl >/dev/null || die "Нет curl."
+  local self tmp
+  self=$(readlink -f "$0")
+  tmp=$(mktemp)
+  curl -fsSL "$SELF_URL?t=$(date +%s)" -o "$tmp" || { rm -f "$tmp"; die "Не скачалось обновление."; }
+  bash -n "$tmp" || { rm -f "$tmp"; die "Скачанный скрипт битый — оставляю старый."; }
+  install -m 755 "$tmp" "$self"
+  rm -f "$tmp"
+  say "✅ st-sync обновлён."
+}
+
 cmd_setup() {
   local c
   for c in git ssh ssh-keygen; do
@@ -437,6 +488,7 @@ case "${1:-sync}" in
   undo)    shift; [[ ${1:-} == -y ]] && YES=1; cmd_undo ;;
   status)  cmd_status ;;
   setup)   cmd_setup ;;
-  help|-h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) die "Не знаю команду «$1». Есть: st-sync, st-sync undo, st-sync status, st-sync setup" ;;
+  update)  cmd_update ;;
+  help|-h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "Не знаю команду «$1». Есть: st-sync, st-sync undo, st-sync status, st-sync update, st-sync setup" ;;
 esac
