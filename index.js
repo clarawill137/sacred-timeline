@@ -11,7 +11,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.6.2';
+const VERSION = '0.6.3';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true };
 const WHO_KEY = 'sacred_timeline_who';
@@ -446,28 +446,38 @@ async function syncPersonaAvatar(data, era, explicit) {
     const mine = Array.isArray(st.eraPersonas) ? st.eraPersonas : (st.eraPersonas = []);
     const current = api.user_avatar;
     const target = wantedPersona(av, explicit, current, mine);
+    // двойник эпохи, на котором должен стоять этот чат (отмеченный чат эпохи со своим аватаром)
+    const twin = explicit && av.target !== av.base ? av.target : null;
     lastAvatar = { avatar: current, base: av.base, missing: null, switched: false };
-    if (!target) return;
+    // ST мог уже сам выбрать двойника по закреплению чата — тогда переключать нечего, но двойника проверить надо
+    if (!target && !(twin && current === twin)) return;
+    const want = target || twin;
     const files = await userAvatarFiles();
-    if (files && !files.includes(target)) { lastAvatar.missing = target; return; }
+    if (files && !files.includes(want)) { lastAvatar.missing = want; return; }
     const c = ctx();
     const pu = c.powerUserSettings;
-    if (target !== av.base && pu && (!pu.personas?.[target] || mine.includes(target) || isPlaceholderPersona(pu, target))) {
+    if (want === twin && pu && (!pu.personas?.[twin] || mine.includes(twin) || isPlaceholderPersona(pu, twin))) {
         // двойник держится в ногу с базовой персоной: правишь её — двойник обновится при следующем входе
-        if (clonePersona(pu, av.base, target, era.personaPatches) && !mine.includes(target)) mine.push(target);
+        if (clonePersona(pu, av.base, twin, era.personaPatches) && !mine.includes(twin)) mine.push(twin);
         c.saveSettingsDebounced?.();
+    }
+    if (!target) {
+        // уже на двойнике: перевыбрать, только если ST держит в памяти старое имя или старый текст персоны
+        const stale = pu && (c.name1 !== pu.personas?.[twin]
+            || String(pu.persona_description ?? '') !== String(pu.persona_descriptions?.[twin]?.description ?? ''));
+        if (!stale) return;
     }
     switchingPersona = true;
     try {
-        await api.setUserAvatar(target, { toastPersonaNameChange: false });
+        await api.setUserAvatar(want, { toastPersonaNameChange: false });
     } finally {
         switchingPersona = false;
     }
-    lastAvatar = { avatar: target, base: av.base, missing: null, switched: true };
+    lastAvatar = { avatar: want, base: av.base, missing: null, switched: true };
     // ST мог перечитать чат после смены персоны — берём свежие метаданные
     const fresh = ctx();
-    if (explicit && target !== av.base && fresh.chatMetadata && fresh.chatMetadata.persona !== target) {
-        fresh.chatMetadata.persona = target;   // закрепить за чатом: ST и сам выберет её при следующем входе
+    if (explicit && want !== av.base && fresh.chatMetadata && fresh.chatMetadata.persona !== want) {
+        fresh.chatMetadata.persona = want;   // закрепить за чатом: ST и сам выберет её при следующем входе
         await fresh.saveMetadata?.();
     }
 }
