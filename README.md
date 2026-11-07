@@ -129,6 +129,10 @@ window.SacredTimeline?.mode('my-ext');          // режим расширки �
 // записи лорбука, которые видно отсюда (дата сюжета, кто говорит, что знает) — если расширка сама читает книги:
 const seen = await window.SacredTimeline?.visible(entries, 'Имя книги');
 
+// Хронограф (лента эпох, как в Фойе): эпохи с чатами, составом и очередью канона + события Хроники (вид автора):
+const map = await window.SacredTimeline?.chronograph();   // { world, span, eras: [...], events: [...] } | null
+await window.SacredTimeline?.enter('id эпохи');           // открыть её каноничный чат — дальше ядро переключит всё само
+
 // снимок поменялся (чат, эпоха, дата, говорящий):
 SillyTavern.getContext().eventSource.on('sacred-timeline:changed', cx => { /* … */ });
 window.addEventListener('sacred-timeline:changed', e => { const cx = e.detail; /* … */ });

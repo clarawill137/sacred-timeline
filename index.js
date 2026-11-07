@@ -15,7 +15,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.9.1';
+const VERSION = '0.9.2';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true, chronicle: true, strazh: true, chronist: true, reviser: '' };
 const WHO_KEY = 'sacred_timeline_who';
@@ -1231,6 +1231,66 @@ export function applyPruned(entry, plan) {
     return true;
 }
 
+// ───────────── Хронограф (для Фойе) ─────────────
+
+/**
+ * Модель ленты: эпохи (с чатами, составом и очередью канона) и события Хроники — для Хронографа в Фойе. Это вид
+ * автора: тайное не прячется, а помечено. События — только канон.
+ */
+export function chronographModel(data, book) {
+    const ids = records(data, 'identity');
+    const nameOf = id => ids.find(g => g.id === id)?.name || id;
+    const w = worldRecord(data);
+    const entries = Object.entries(book?.entries || {}).map(([k, e]) => ({ ...e, uid: Number(e?.uid ?? k) }));
+    const eras = records(data, 'era').map(e => {
+        const mine = entries.filter(x => String(x?.gc?.src?.era || '') === String(e.id) && x.gc.src?.stmb);
+        return {
+            id: String(e.id), label: e.label || String(e.id), from: e.from || null, to: e.to || null, status: e.status || 'active',
+            canonChat: e.canonChat || null, group: e.group || null, chats: Array.isArray(e.chats) ? [...e.chats] : [],
+            cast: (e.cast || []).map(sid => sliceById(data, sid)?.identity?.name).filter(Boolean),
+            persona: e.persona ? (sliceById(data, e.persona)?.slice?.label || null) : null,
+            note: e.note ? String(e.note).split(/(?<=[.!?])\s/)[0].slice(0, 220) : '',
+            queue: { review: mine.filter(x => x.gc.status === 'review').length, nexus: mine.filter(x => x.gc.status === 'nexus').length },
+        };
+    }).sort((a, b) => String(a.from || '9999').localeCompare(String(b.from || '9999')));
+    const eraAt = (d) => {
+        const at = String(d || '');
+        return eras.find(e => e.from && at >= e.from && (!e.to || at <= e.to || at.startsWith(e.to)))?.id || null;
+    };
+    const events = entries
+        .filter(e => e.gc && CHRON_KINDS.includes(e.gc.kind) && e.gc.from && (!e.gc.status || e.gc.status === 'canon'))
+        .map(e => ({
+            uid: e.uid, kind: e.gc.kind, from: String(e.gc.from), to: e.gc.to ? String(e.gc.to) : null, approx: !!e.gc.approx,
+            sym: CHRON_SYM[e.gc.kind] || '•', title: cleanTitle(e.comment), who: (e.gc.who || []).map(nameOf),
+            secret: !!e.gc.secret && !isPublic(e.gc, '9999'), played: playedEvent(e.gc), era: eraAt(e.gc.from),
+            text: String(e.content || '').slice(0, 1200),
+        }))
+        .sort((a, b) => a.from.localeCompare(b.from) || a.uid - b.uid);
+    return { world: w ? { id: w.id, name: w.name || w.id } : null, span: ['1917', '2025'], eras, events };
+}
+
+/** Войти в эпоху: открыть её каноничный (или указанный) чат — группу или чат карточки из состава эпохи. */
+async function enterEra(eraId, chatId = null) {
+    const data = await loadRegistry();
+    const era = data ? eraById(data, eraId) : null;
+    if (!era) throw new Error('нет такой эпохи');
+    const chat = chatId || era.canonChat || era.chats?.[0];
+    if (!chat) throw new Error('у эпохи ещё нет чата');
+    const c = ctx();
+    if (era.group) {
+        if (typeof c.openGroupChat !== 'function') throw new Error('в таверне нет openGroupChat');
+        await c.openGroupChat(era.group, chat);
+        return true;
+    }
+    const cards = (era.cast || []).map(sid => sliceById(data, sid)?.slice?.card).filter(Boolean);
+    const idx = (c.characters || []).findIndex(ch => cards.includes(ch?.avatar));
+    if (idx < 0) throw new Error(`нет карточки эпохи: ${cards.join(', ') || '—'}`);
+    if (String(c.characterId) !== String(idx)) await c.selectCharacterById(idx);
+    if (typeof c.openCharacterChat !== 'function') throw new Error('в таверне нет openCharacterChat');
+    await c.openCharacterChat(chat);
+    return true;
+}
+
 // ───────────── контракт для расширок ─────────────
 //
 // Ядро не лезет в настройки чужих расширок. Три рычага:
@@ -2246,6 +2306,16 @@ if (typeof jQuery === 'function') {
             },
             era: () => ({ ...current }),
             registry: loadRegistry,
+            /** Хронограф: эпохи и события Хроники для ленты (вид автора; тайное помечено). Нет мира — null. */
+            chronograph: async () => {
+                const data = await loadRegistry();
+                const w = data ? worldRecord(data) : null;
+                if (!data || !w) return null;
+                const book = w.chronicle ? await ctx().loadWorldInfo?.(w.chronicle) : null;
+                return chronographModel(data, book);
+            },
+            /** Войти в эпоху: открыть её каноничный чат (или chatId) — дальше ядро переключит всё само. */
+            enter: (eraId, chatId) => enterEra(eraId, chatId),
             present: async (name, date) => {
                 const data = await loadRegistry();
                 const id = data && findIdentity(data, name);
