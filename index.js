@@ -1,21 +1,27 @@
-// Священный таймлайн — ядро, v0.2.
+// Священный таймлайн — ядро, v0.4.
 // Узнаёт эпоху и дату открытого чата по Реестру мира (лорбук на сервере, имя кончается на «Реестр») и:
 //  • пускает в промпт только лорбуки и записи своей эпохи (книги по эпохам, записи Хроники из будущего — вон);
 //  • тайны — только тем, кто их знает (gc.knows говорящего на дату), и не раньше, чем персона их прожила (gc.personal);
 //  • правит персону прямо в промпте под эпоху (возраст, «сейчас», внешность) — сама персона в ST не меняется;
-//  • убирает из Закулисья тех, кого в этой эпохе нет: умер, пыль, лёд, ещё не родился.
+//  • убирает из Закулисья тех, кого в этой эпохе нет: умер, пыль, лёд, ещё не родился;
+//  • «кто есть кто» — короткая шпаргалка эпохи на дату сюжета в промпт (строки эпохи + кого здесь нет и почему).
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const TAG = '[Священный таймлайн]';
-const DEFAULTS = { filterLore: true, persona: true };
+const DEFAULTS = { filterLore: true, persona: true, who: true };
+const WHO_KEY = 'sacred_timeline_who';
+const WHO_DEPTH = 1;     // перед последним сообщением чата
+const IN_CHAT = 1;       // extension_prompt_types.IN_CHAT
+const ROLE_SYSTEM = 0;   // extension_prompt_roles.SYSTEM
 
 const ctx = () => SillyTavern.getContext();
 
 let current = { chatId: null, era: null, explicit: false, date: null, dateSource: '', registry: null };
 let lastLore = null;     // что срезали в последний раз
 let lastPersona = null;  // сколько правок персоны применили в последний раз
+let lastWho = null;      // сколько строк «кто есть кто» ушло в промпт в последний раз
 
 function settings() {
     const ext = ctx().extensionSettings;
@@ -306,6 +312,56 @@ export function personaIdentity(data) {
     return records(data, 'identity').find(g => g.persona)?.id || null;
 }
 
+// ───────────── кто есть кто ─────────────
+
+/** Строки эпохи на дату: у строки бывают from/to (как у записей Хроники) и speaker — только на его ходу. */
+export function whoLines(era, at, speaker) {
+    if (!Array.isArray(era?.who)) return [];
+    return era.who
+        .filter(w => w && w.text && (!w.speaker || w.speaker === speaker)
+            && (at ? covers(w, at) : w.from == null && w.to == null))
+        .map(w => String(w.text).trim());
+}
+
+/** Кого ядро закомментировало в составе Закулисья (и ты не вернула) — их нет в этом времени. */
+export function absentNames(roster) {
+    return String(roster || '').split('\n')
+        .map(l => l.trim())
+        .filter(l => l.startsWith('#') && l.includes('← нет в эпохе'))
+        .map(l => l.replace(/^#\s*/, '').split('|')[0].trim())
+        .filter(Boolean);
+}
+
+/** Почему личности нет на дату: её gc.gone (с from/to), иначе по died / born, иначе «нет в этом времени». */
+export function goneReason(identity, at) {
+    const hit = (identity?.gone || []).find(s => s && s.text && covers(s, at));
+    if (hit) return hit.text;
+    if (identity?.died && at && at >= String(identity.died)) return `нет в живых с ${fmtDate(identity.died)}`;
+    if (identity?.born && at && at < String(identity.born)) return 'ещё не на свете';
+    return 'нет в этом времени';
+}
+
+/**
+ * Шпаргалка «кто есть кто» на дату. Только для эпох, у которых в Реестре есть список who (пусть пустой):
+ * строки эпохи + кого нет в этом времени и почему. Пусто — ''.
+ */
+export function whoBlock(data, era, date, speaker, roster) {
+    if (!Array.isArray(era?.who)) return '';
+    const at = date || era.from || null;
+    const lines = whoLines(era, at, speaker);
+    const gone = new Map();
+    for (const name of absentNames(roster)) {
+        const id = findIdentity(data, name);
+        if (!id) continue;
+        const why = at ? goneReason(id, at) : 'нет в этом времени';
+        if (!gone.has(why)) gone.set(why, []);
+        if (!gone.get(why).includes(id.name)) gone.get(why).push(id.name);
+    }
+    if (gone.size) lines.push('Нет в этом времени: ' + [...gone].map(([why, names]) => `${names.join(', ')} — ${why}`).join('; ') + '.');
+    if (!lines.length) return '';
+    return `[Хроника — кто есть кто${date ? ` на ${fmtDate(date)}` : ''}]\n` + lines.map(l => `— ${l}`).join('\n');
+}
+
 // ───────────── состояние чата ─────────────
 
 /** Эпоха и дата открытого чата. explicit — эпоха отмечена в Реестре, а не взята по умолчанию. */
@@ -376,6 +432,8 @@ async function onChatChanged({ reset = true } = {}) {
     if (reset) {
         lastLore = null;
         lastPersona = null;
+        lastWho = null;
+        ctx().setExtensionPrompt?.(WHO_KEY, '', IN_CHAT, WHO_DEPTH, false, ROLE_SYSTEM);
     }
     const { data, era, explicit, date, md } = await resolve();
     renderStatus();
@@ -412,6 +470,26 @@ async function onEntriesLoaded(payload) {
     }
 }
 
+/** Перед каждой генерацией (в группе — на ходу каждого участника): «кто есть кто» в промпт или пусто. */
+async function onGenerationStarted() {
+    if (typeof ctx().setExtensionPrompt !== 'function') return;
+    try {
+        let block = '';
+        if (settings().who) {
+            const { data, era, explicit, date, md } = await resolve();
+            if (data && era && explicit) {
+                const c = ctx();
+                block = whoBlock(data, era, date, speakerOf(data, c.characters?.[c.characterId], c.name2), md?.backstage?.roster);
+            }
+        }
+        ctx().setExtensionPrompt(WHO_KEY, block, IN_CHAT, WHO_DEPTH, false, ROLE_SYSTEM);
+        lastWho = block ? block.split('\n').length - 1 : 0;
+        renderStatus();
+    } catch (e) {
+        console.warn(TAG, '«кто есть кто» пропущен', e);
+    }
+}
+
 async function onPromptReady(event) {
     try {
         if (!settings().persona || !event?.chat) return;
@@ -429,6 +507,13 @@ async function onPromptReady(event) {
 
 function esc(s) {
     return String(s ?? '').replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+}
+
+function plural(n, one, few, many) {
+    const a = n % 10, b = n % 100;
+    if (a === 1 && b !== 11) return one;
+    if (a >= 2 && a <= 4 && (b < 12 || b > 14)) return few;
+    return many;
 }
 
 function fmtDate(d) {
@@ -461,6 +546,8 @@ function statusLines() {
         out.push('Лорбуки: покажу после первой генерации.');
     }
     if (lastPersona !== null) out.push(lastPersona ? `Персона: срез эпохи — правок ${lastPersona}` : 'Персона: без правок');
+    if (!settings().who) out.push('Кто есть кто: выключено');
+    else if (lastWho !== null) out.push(lastWho ? `Кто есть кто: ${lastWho} ${plural(lastWho, 'строка', 'строки', 'строк')} в промпте` : 'Кто есть кто: для этой эпохи нет');
     return out;
 }
 
@@ -485,6 +572,8 @@ function renderSettings() {
             <span>Лорбуки по эпохе чата</span></label>
           <label class="checkbox_label"><input type="checkbox" id="sacred_timeline_persona" ${s.persona ? 'checked' : ''}>
             <span>Персона по эпохе чата</span></label>
+          <label class="checkbox_label"><input type="checkbox" id="sacred_timeline_who" ${s.who ? 'checked' : ''}>
+            <span>«Кто есть кто» в промпте</span></label>
           <div class="menu_button" id="sacred_timeline_check">Проверить этот чат</div>
           <small>v${VERSION} · /era — эпоха чата</small>
         </div>
@@ -493,6 +582,12 @@ function renderSettings() {
     $('#extensions_settings2').append(html);
     $('#sacred_timeline_lore').on('change', function () { settings().filterLore = this.checked; ctx().saveSettingsDebounced(); });
     $('#sacred_timeline_persona').on('change', function () { settings().persona = this.checked; ctx().saveSettingsDebounced(); });
+    $('#sacred_timeline_who').on('change', function () {
+        settings().who = this.checked;
+        if (!this.checked) ctx().setExtensionPrompt?.(WHO_KEY, '', IN_CHAT, WHO_DEPTH, false, ROLE_SYSTEM);
+        ctx().saveSettingsDebounced();
+        renderStatus();
+    });
     $('#sacred_timeline_check').on('click', () => { onChatChanged({ reset: false }).catch(e => console.warn(TAG, e)); });
     renderStatus();
 }
@@ -534,6 +629,7 @@ if (typeof jQuery === 'function') {
         // эти два ST ждёт — правки успевают попасть в промпт
         eventSource.on(eventTypes.WORLDINFO_ENTRIES_LOADED, onEntriesLoaded);
         eventSource.on(eventTypes.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
+        if (eventTypes.GENERATION_STARTED) eventSource.on(eventTypes.GENERATION_STARTED, onGenerationStarted);
         registerSlash();
         window.SacredTimeline = {
             version: VERSION,
