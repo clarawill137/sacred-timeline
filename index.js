@@ -13,7 +13,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.7.0';
+const VERSION = '0.7.1';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true };
 const WHO_KEY = 'sacred_timeline_who';
@@ -29,6 +29,7 @@ let lastPersona = null;  // сколько правок персоны прим�
 let lastWho = null;      // сколько строк «кто есть кто» ушло в промпт в последний раз
 let lastBooks = null;    // книги эпохи: { added: [имена], missing: [имена], entries: n }
 let lastAvatar = null;   // аватар персоны: { avatar, base, missing, switched }
+let lastMemory = null;   // память эпохи: { book, bound, missing, other }
 let switchingPersona = false;
 
 function settings() {
@@ -291,6 +292,26 @@ async function joinEraBooks(payload, era) {
         if (data?.entries) { out.added.push(name); out.entries += n; } else out.missing.push(name);
     }
     return out;
+}
+
+/** Кто и когда смотрит: эпоха, дата, говорящий, персона — для judgeEntry. */
+export function scopeFor(data, era, date, c) {
+    return {
+        eraId: era.id,
+        date,
+        eraFrom: era.from || null,
+        speaker: speakerOf(data, c?.characters?.[c?.characterId], c?.name2),
+        personaId: personaIdentity(data),
+        personaNow: era.personaTime || date || era.from || null,
+    };
+}
+
+/**
+ * Что из записей книги видно отсюда — для расширок, которые сами читают лорбуки (поиск по памяти и т. п.).
+ * Выключенные записи судим как включённые: ST их сам не вставит, а поиск — может.
+ */
+export function visibleEntries(entries, world, scope, books) {
+    return (entries || []).filter(e => e && judgeEntry({ ...e, world, disable: false }, scope, books) !== 'drop');
 }
 
 export function filterLore(payload, scope, books) {
@@ -561,6 +582,40 @@ async function resolve() {
     return { data, era, explicit, date, md };
 }
 
+// ───────────── память эпохи ─────────────
+
+/**
+ * Какую книгу поставить книгой чата, чтобы память эпохи писалась в её меморибук. STMB пишет в книгу чата, ST её же
+ * подаёт в промпт. Только у эпох с bindMemory и только в каноничном чате; чужую книгу чата не перебиваем — меняем
+ * только пустую или одну из книг эпохи (их ядро и так подключает само). null — ничего не делать.
+ */
+export function memoryBinding(era, explicit, chatId, current) {
+    if (!explicit || !era?.bindMemory || !era.memoryBook || !chatId || chatId !== era.canonChat) return null;
+    if (current === era.memoryBook) return null;
+    if (current && !(era.lore || []).includes(current)) return null;
+    return era.memoryBook;
+}
+
+async function bindEraMemory(era, explicit, chatId) {
+    const md = ctx().chatMetadata;
+    lastMemory = null;
+    if (!explicit || !era?.memoryBook || !md) return;
+    const isCanon = chatId === era.canonChat;
+    lastMemory = { book: era.memoryBook, bound: md.world_info === era.memoryBook, missing: false,
+        other: md.world_info && md.world_info !== era.memoryBook ? md.world_info : null, canon: isCanon };
+    const want = memoryBinding(era, explicit, chatId, md.world_info);
+    if (!want) return;
+    const known = ctx().getWorldInfoNames?.();
+    if (Array.isArray(known) && !known.includes(want)) { lastMemory.missing = true; return; }
+    md.world_info = want;
+    await ctx().saveMetadata?.();
+    lastMemory.bound = true;
+    lastMemory.other = null;
+    const msg = `Память эпохи ${era.id}: книга чата теперь «${want}» — STMB пишет туда.`;
+    console.log(TAG, msg);
+    try { window.toastr?.info(msg, 'Священный таймлайн', { timeOut: 8000 }); } catch { /* ignore */ }
+}
+
 // ───────────── контракт для расширок ─────────────
 //
 // Ядро не лезет в настройки чужих расширок. Три рычага:
@@ -709,7 +764,7 @@ export function buildContext(data, cur, c) {
     const pr = sliceById(data, era.persona);
     return {
         v: 1,
-        world: w ? { id: w.id || null, name: w.name || null } : null,
+        world: w ? { id: w.id || null, name: w.name || null, chronicle: w.chronicle || null } : null,
         era: { id: String(era.id), label: era.label || '', from: era.from || null, to: era.to || null,
             status: era.status || null, memoryBook: era.memoryBook || null, lore: [...(era.lore || [])] },
         explicit: !!cur.explicit,
@@ -836,11 +891,15 @@ async function onChatChanged({ reset = true } = {}) {
         lastWho = null;
         lastBooks = null;
         lastAvatar = null;
+        lastMemory = null;
         ctx().setExtensionPrompt?.(WHO_KEY, '', IN_CHAT, WHO_DEPTH, false, ROLE_SYSTEM);
     }
     const { data, era, explicit, date, md } = await resolve();
     if (reset && ctx().getCurrentChatId?.() === chatId) {
         try { await syncPersonaAvatar(data, era, explicit); } catch (e) { console.warn(TAG, 'аватар персоны не переключён', e); }
+    }
+    if (reset && ctx().getCurrentChatId?.() === chatId) {
+        try { await bindEraMemory(era, explicit, chatId); } catch (e) { console.warn(TAG, 'память эпохи не привязана', e); }
     }
     if (ctx().getCurrentChatId?.() === chatId) {
         try { await publish(data); } catch (e) { console.warn(TAG, 'снимок для расширок не разослан', e); }
@@ -865,15 +924,7 @@ async function onEntriesLoaded(payload) {
         if (!data || !era) return;
         // книги эпохи — только в чатах, отмеченных в Реестре; дальше они проходят тот же фильтр, что и все
         lastBooks = explicit ? await joinEraBooks(payload, era) : null;
-        const c = ctx();
-        const scope = {
-            eraId: era.id,
-            date,
-            eraFrom: era.from || null,
-            speaker: speakerOf(data, c.characters?.[c.characterId], c.name2),
-            personaId: personaIdentity(data),
-            personaNow: era.personaTime || date || era.from || null,
-        };
+        const scope = scopeFor(data, era, date, ctx());
         lastLore = filterLore(payload, scope, worldRecord(data)?.books || {});
         lastLore.speaker = scope.speaker ? (records(data, 'identity').find(g => g.id === scope.speaker)?.name || scope.speaker) : null;
         renderStatus();
@@ -975,6 +1026,12 @@ function statusLines() {
     else if (lastPersona !== null) out.push(lastPersona ? `Персона: срез эпохи — правок ${lastPersona}` : 'Персона: без правок');
     if (lastAvatar?.missing) out.push(`Аватар персоны эпохи «${esc(lastAvatar.missing)}» не найден в User Avatars — оставила как есть`);
     else if (lastAvatar?.avatar && lastAvatar.avatar !== lastAvatar.base) out.push(`Аватар персоны: ${esc(lastAvatar.avatar)} (эпоха)`);
+    if (lastMemory) {
+        if (lastMemory.missing) out.push(`Память эпохи «${esc(lastMemory.book)}» — нет на сервере, книгу чата не трогала`);
+        else if (lastMemory.bound) out.push(`Память эпохи: «${esc(lastMemory.book)}» — книга чата, STMB пишет туда`);
+        else if (lastMemory.other) out.push(`Память эпохи — «${esc(lastMemory.book)}», а у чата своя книга «${esc(lastMemory.other)}»${lastMemory.canon ? ' (не трогаю)' : ''}`);
+        else if (!lastMemory.canon) out.push(`Память эпохи — «${esc(lastMemory.book)}» (этот чат не каноничный — книгу не ставлю)`);
+    }
     if (!settings().who) out.push('Кто есть кто: выключено');
     else if (lastWho !== null) out.push(lastWho ? `Кто есть кто: ${lastWho} ${plural(lastWho, 'строка', 'строки', 'строк')} в промпте` : 'Кто есть кто: для этой эпохи нет');
     return out;
@@ -1066,6 +1123,15 @@ if (typeof jQuery === 'function') {
             context: () => (lastContext ? JSON.parse(lastContextJson) : null),
             /** Режим расширки в этой эпохе: 'on' | 'off' | 'quiet' | 'hidden' | свой. Вне эпох — 'on'. */
             mode: (id) => (lastContext?.ext?.[id]) || 'on',
+            /**
+             * Записи книги, которые видно отсюда (эпоха, дата сюжета, кто сейчас говорит, что знает) — для расширок,
+             * которые сами читают лорбуки. Вне мира — все как есть.
+             */
+            visible: async (entries, world) => {
+                const { data, era, date } = await resolve();
+                if (!data || !era) return [...(entries || [])];
+                return visibleEntries(entries, world, scopeFor(data, era, date, ctx()), worldRecord(data)?.books || {});
+            },
             era: () => ({ ...current }),
             registry: loadRegistry,
             present: async (name, date) => {
