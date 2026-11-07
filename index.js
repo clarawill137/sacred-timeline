@@ -1,4 +1,4 @@
-// Священный таймлайн — ядро, v0.8.
+// Священный таймлайн — ядро, v0.9.
 // Узнаёт эпоху и дату открытого чата по Реестру мира (лорбук на сервере, имя кончается на «Реестр») и:
 //  • пускает в промпт только лорбуки и записи своей эпохи (книги по эпохам, записи Хроники из будущего — вон);
 //  • тайны — только тем, кто их знает (gc.knows говорящего на дату), и не раньше, чем персона их прожила (gc.personal);
@@ -9,13 +9,15 @@
 //  • аватар персоны по эпохе: у обличья эпохи свой файл в User Avatars — ядро заводит персону-двойника
 //    (то же имя, описание — уже с правками эпохи) и переключает на неё в чатах эпохи; уходя — возвращает базовую;
 //  • расширки: SacredTimeline.context() и событие «sacred-timeline:changed» (мир, эпоха, дата, говорящий, состав,
-//    персона, режимы); режимы расширок по эпохам из Реестра — глушит их промпт и прячет кнопки, настроек не трогает.
+//    персона, режимы); режимы расширок по эпохам из Реестра — глушит их промпт и прячет кнопки, настроек не трогает;
+//  • канон: Страж (графа в Летописце Life, 🚩 под постом), Хронист (память канон-чата → подзаписи Хроники 🟡),
+//    Ревизор (сильная модель сверяет с Хроникой), решение — вписать / только память / своё / подрезать.
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.8.4';
+const VERSION = '0.9.0';
 const TAG = '[Священный таймлайн]';
-const DEFAULTS = { filterLore: true, persona: true, who: true, chronicle: true };
+const DEFAULTS = { filterLore: true, persona: true, who: true, chronicle: true, strazh: true, chronist: true, reviser: '' };
 const WHO_KEY = 'sacred_timeline_who';
 const CHRON_KEY = 'sacred_timeline_chronicle';
 const IN_PROMPT = 0;     // extension_prompt_types.IN_PROMPT
@@ -34,6 +36,8 @@ let lastAvatar = null;   // аватар персоны: { avatar, base, missing
 let lastMemory = null;   // память эпохи: { book, bound, missing, other }
 let lastHistory = null;  // память прошлых эпох в промпте: { added: [книги], entries: n }
 let lastChron = null;    // Хроника под дату: { past, ahead } — сколько строк ушло
+let lastCanon = null;    // строки «Канон» для Стража (Летописец Life): { input, chatId }
+let lastDrafts = [];     // подзаписи Хроники этой эпохи на проверке: [{ uid, title, status, who, review }]
 let switchingPersona = false;
 
 function settings() {
@@ -656,6 +660,16 @@ export function legacyChronicleActive(book, eraId) {
  * закрытых до эпохи отрезков не дублируем). Впереди: ближайшие фиксированные точки — режиссёрской пометкой «не
  * ломать», персонажи о них не знают.
  */
+/** Сыграно ли событие: gc.played (true или дата сцены) или пришло из чата (src.chat / src.stmb). */
+const playedEvent = (g) => !!g?.played || (typeof g?.src === 'object' && !!(g.src?.chat || g.src?.stmb));
+/** Событие своей эпохи позже её начала (или крупнее: год, с которого она начинается) и ещё не сыгранное. */
+export function heldInEra(g, eraFrom) {
+    if (!g || g.kind !== 'event' || playedEvent(g) || !eraFrom) return false;
+    const f = String(g.from);
+    const from = String(eraFrom);
+    return f > from || (f !== from && from.startsWith(f));
+}
+
 export function chronicleBlock(book, scope, books, { world, eraFrom, ahead = 4, maxPast = 40 } = {}) {
     const at = scope?.date || scope?.eraFrom;
     const out = { text: '', past: 0, ahead: 0, held: 0 };
@@ -693,12 +707,7 @@ export function chronicleBlock(book, scope, books, { world, eraFrom, ahead = 4, 
     // событие своей эпохи — позже её начала (или крупнее: год, в котором она начинается) — в «что было», только когда
     // сыграно: gc.played (true или дата сцены) или пришло из чата (src.chat / src.stmb). Ролка могла до него ещё не
     // дойти — сводка не должна обгонять чат. Дата ровно в начало эпохи — завязка, она уже была.
-    const played = (g) => !!g.played || (typeof g.src === 'object' && !!(g.src?.chat || g.src?.stmb));
-    const held = (g) => {
-        if (g.kind !== 'event' || played(g)) return false;
-        const f = String(g.from);
-        return f > from || (f !== from && from.startsWith(f));
-    };
+    const held = (g) => heldInEra(g, from);
     const when = (g) => (typeof g.played === 'string' && g.played ? g.played : String(g.from));
     const seen = all.filter(e => when(e.gc) <= at
         && !held(e.gc)
@@ -851,7 +860,7 @@ export function historyBooks(data, era) {
 export const isMemoryEntry = e => !!e && (e.STMB_start !== undefined || e.stmemorybooks !== undefined);
 
 /** В историю других эпох уходит только размеченная память: без даты и знания запись остаётся в своей эпохе. */
-export const isTaggedMemory = e => e?.gc?.kind === 'memory';
+export const isTaggedMemory = e => e?.gc?.kind === 'memory' && (!e.gc.status || e.gc.status === 'canon') && !e.disable;
 
 /**
  * Разметить свежие записи STMB в меморибуке эпохи: дата сцены (по трекеру/Horae у последнего сообщения сцены,
@@ -886,7 +895,10 @@ export function tagMemories(book, { data, era, chat, md, chatId }) {
 }
 
 let tagging = false;
-/** Разметить память эпохи в её каноничном чате (после записи STMB и при входе в чат). */
+/**
+ * Разметить память эпохи в её каноничном чате (после записи STMB и при входе в чат). Хронист: свежая размеченная
+ * память — подзаписью Хроники 🟡 на проверке (только каноничный чат эпохи).
+ */
 async function tagEraMemory(name, book) {
     if (tagging) return 0;
     const c = ctx();
@@ -900,14 +912,197 @@ async function tagEraMemory(name, book) {
         const b = book || await c.loadWorldInfo?.(era.memoryBook);
         if (!b?.entries) return 0;
         const n = tagMemories(b, { data, era, chat: c.chat, md: c.chatMetadata, chatId });
-        if (n) {
+        let drafts = [];
+        const w = worldRecord(data);
+        if (settings().chronist && w?.chronicle) {
+            const chron = await c.loadWorldInfo?.(w.chronicle);
+            if (chron?.entries) {
+                drafts = chronicleDrafts(b, era.memoryBook, chron, era, chatId);
+                if (drafts.length) await c.saveWorldInfo?.(w.chronicle, chron, true);
+            }
+        }
+        if (n || drafts.length) {
             await c.saveWorldInfo?.(era.memoryBook, b, true);
-            console.log(TAG, `память эпохи ${era.id}: размечено записей — ${n}`);
+            console.log(TAG, `память эпохи ${era.id}: размечено записей — ${n}, подзаписей Хроники на проверке — ${drafts.length}`);
+        }
+        if (drafts.length) {
+            try { window.toastr?.info(`В Хронику на проверку: ${drafts.length} 🟡 — Священный таймлайн → «Канон»`, 'Хронист'); } catch { /* */ }
+            refreshDrafts().catch(e => console.warn(TAG, e));
         }
         return n;
     } finally {
         tagging = false;
     }
+}
+
+// ───────────── канон: Страж, Хронист, Ревизор (план 07.11) ─────────────
+//
+// Страж — графа «canon» в Летописце Life (LifeBridge): после поста дешёвая модель Летописца сверяет пост с каноном
+// эпохи — фиксированные точки впереди, кого нет в этом времени, кто в сцене каких тайн не знает — и ставит 🚩.
+// Хронист — память STMB каноничного чата эпохи (уже с датой и знанием) становится подзаписью Хроники 🟡 «на проверке».
+// Ревизор — сильная модель (свой профиль подключения) сверяет подзапись с Хроникой: в рамках или нексус.
+// Решаешь ты: ✓ вписать в таймлайн · ○ только память · ⑂ своё (ветка: в историю других эпох не идёт) · ✂ подрезать.
+// В Хронику пишет только каноничный чат эпохи.
+
+export const DRAFT_MARK = { review: '🟡', nexus: '⚠️', canon: '✓', memo: '○', own: '⑂', pruned: '✂' };
+const DRAFT_OPEN = ['review', 'nexus'];
+
+export const STRAZH_RULE = `
+
+canon — Страж канона по ЭТОМУ посту, по строкам «Канон»: {"flag":"ok"}, если пост в рамках. Иначе {"flag":"warn" или "break","what":"что не так, 6–16 слов","fix":"как поправить, 6–14 слов"}. break — пост ломает фиксированную точку или в сцене действует тот, кого в этом времени нет; warn — кто-то знает то, чего знать не может (тайну из списка, будущее), или пост расходится с каноном. Стиль, мелочи и выдумки, которые канону не мешают, — не твоё. Сомневаешься — ok.`;
+
+const cleanTitle = (t) => String(t || '').replace(/^[◆●▬▭■•]\s*/, '').trim();
+
+/** Строки «Канон» для Стража: дата, фиксированные точки впереди, кого нет, тайны среди тех, кто в сцене. */
+export function canonBrief({ data, era, date, book, cast = [] }) {
+    const at = date || era?.from || null;
+    if (!era || !at) return '';
+    const ids = records(data, 'identity');
+    const nameOf = id => ids.find(g => g.id === id)?.name || id;
+    const lines = [`Канон (Священный таймлайн): эпоха «${era.label || era.id}», дата сюжета — ${fmtDate(at)}. Никто не знает будущего — того, что случится позже этой даты.`];
+    const entries = Object.values(book?.entries || {}).filter(e => e?.gc && CHRON_KINDS.includes(e.gc.kind) && e.gc.from
+        && (!e.gc.status || e.gc.status === 'canon'));
+    const ahead = entries.filter(e => e.gc.kind === 'fixed' && String(e.gc.from) > at)
+        .sort((a, b) => String(a.gc.from).localeCompare(String(b.gc.from))).slice(0, 4);
+    if (ahead.length) lines.push(`Канон — впереди, ломать нельзя (в сцене о них не знают): ${ahead.map(e => cleanTitle(e.comment)).join('; ')}.`);
+    const gone = ids.filter(g => (g.slices || []).length && !presentAt(g, at)).map(g => `${g.name} — ${goneReason(g, at)}`);
+    if (gone.length) lines.push(`Канон — в этом времени нет (не могут быть в сцене): ${gone.slice(0, 10).join('; ')}.`);
+    const who = [...new Set(cast.filter(Boolean))];
+    if (who.length > 1) {
+        const knowsAt = (g, id) => (g.knows && typeof g.knows === 'object'
+            ? (g.knows[id] || []).some(s => s.mode === 'knows' && covers(s, at))
+            : (g.who || []).includes(id));
+        const secrets = [];
+        for (const e of entries) {
+            const g = e.gc;
+            if (!g.secret || String(g.from) > at || isPublic(g, at) || heldInEra(g, era.from)) continue;
+            if (g.kind === 'state' && g.to && at > String(g.to) && !at.startsWith(String(g.to))) continue;
+            const yes = who.filter(id => knowsAt(g, id));
+            const no = who.filter(id => !yes.includes(id));
+            // в сцене был, а не знает (обманутый участник) — проговориться тут проще всего, такие — первыми
+            const blind = no.some(id => (g.who || []).includes(id)) ? 1 : 0;
+            if (yes.length && no.length) secrets.push({ e, yes, no, blind });
+        }
+        secrets.sort((a, b) => (b.blind - a.blind) || String(b.e.gc.from).localeCompare(String(a.e.gc.from)));
+        if (secrets.length) {
+            lines.push('Канон — тайны среди тех, кто в сцене (кто не знает, тот проговориться не может):\n' + secrets.slice(0, 8)
+                .map(({ e, yes, no }) => `- ${cleanTitle(e.comment)} — знает: ${yes.map(nameOf).join(', ')}; НЕ знает: ${no.map(nameOf).join(', ')}`).join('\n'));
+        }
+    }
+    return lines.join('\n');
+}
+
+/** Ключ флажка Стража у поста: номер, свайп, хэш текста — свайпнули или поправили, флажок старого текста не висит. */
+export function strazhKey(m, i) {
+    let h = 0;
+    const s = String(m?.mes || '');
+    for (let k = 0; k < s.length; k++) h = (h * 31 + s.charCodeAt(k)) | 0;
+    return `${i}:${m?.swipe_id ?? 0}:${(h >>> 0).toString(36)}`;
+}
+
+/** Ответ Летописца по графе canon → запись флажка (или null, если ответа нет). */
+export function strazhRecord(j) {
+    const c = j?.canon;
+    if (!c || typeof c !== 'object') return null;
+    const flag = ['warn', 'break'].includes(String(c.flag)) ? String(c.flag) : 'ok';
+    if (flag === 'ok') return { flag };
+    return { flag, what: String(c.what || '').slice(0, 200), fix: String(c.fix || '').slice(0, 200), at: Date.now() };
+}
+
+function strazhStore(md) {
+    const s = md && (md[MODULE] ||= {});
+    if (!s) return {};
+    if (!s.strazh || typeof s.strazh !== 'object') s.strazh = {};
+    return s.strazh;
+}
+
+/** Подзаписи Хроники 🟡 из свежей памяти каноничного чата эпохи. Память получает ссылку gc.draft. Возвращает uid'ы. */
+export function chronicleDrafts(memBook, memName, chron, era, chatId) {
+    const out = [];
+    if (!memBook?.entries || !chron?.entries || !era) return out;
+    let next = Math.max(-1, ...Object.keys(chron.entries).map(Number).filter(Number.isFinite)) + 1;
+    for (const e of Object.values(memBook.entries)) {
+        const g = e?.gc;
+        if (!g || g.kind !== 'memory' || g.draft != null || e.disable) continue;
+        if (g.status && g.status !== 'canon') continue;
+        if (String(g.era) !== String(era.id) || (chatId && g.src?.chat && g.src.chat !== chatId)) continue;
+        const uid = next++;
+        const title = cleanTitle(e.comment) || String(e.content || '').split('\n')[0].slice(0, 80) || 'сцена';
+        chron.entries[String(uid)] = {
+            uid,
+            gc: { v: 1, kind: 'event', from: g.from, ...(g.who?.length ? { who: [...g.who] } : {}), secret: true,
+                ...(g.knows ? { knows: JSON.parse(JSON.stringify(g.knows)) } : {}), status: 'review',
+                src: { era: String(era.id), chat: g.src?.chat || chatId || null, msgs: g.src?.msgs || null, stmb: `${memName}#${e.uid}` } },
+            key: [], keysecondary: [], comment: `● ${fmtDate(g.from)} — ${title}`, content: String(e.content || ''),
+            constant: false, vectorized: false, selective: true, selectiveLogic: 0, addMemo: true, order: 100, position: 0,
+            disable: true, excludeRecursion: false, preventRecursion: false, delayUntilRecursion: false, probability: 100,
+            useProbability: true, depth: 4, group: '', groupOverride: false, groupWeight: 100, scanDepth: null,
+            caseSensitive: false, matchWholeWords: false, useGroupScoring: false, automationId: '', role: 0, sticky: 0,
+            cooldown: 0, delay: 0, display_index: uid,
+        };
+        g.draft = uid;
+        out.push(uid);
+    }
+    return out;
+}
+
+/** Решение по подзаписи: статус в Хронике и что станет с памятью. Возвращает { memoryStatus, disable } для памяти. */
+export function decideDraft(entry, status) {
+    if (!entry?.gc || !DRAFT_MARK[status]) return null;
+    entry.gc.status = status;
+    entry.gc.decided = new Date().toISOString().slice(0, 10);
+    if (status === 'own') return { memoryStatus: 'own', disable: false };        // ветка: в истории других эпох нет
+    if (status === 'pruned') return { memoryStatus: 'pruned', disable: true };   // подрезано: не было
+    return { memoryStatus: 'canon', disable: false };                            // вписано или только память
+}
+
+/** Запрос Ревизору: подзапись + канон рядом. */
+export function reviserPrompt(entry, book, era) {
+    const g = entry.gc;
+    const at = String(g.from || era?.from || '');
+    const year = Number(at.slice(0, 4)) || 0;
+    const all = Object.entries(book?.entries || {}).filter(([, e]) => e?.gc && CHRON_KINDS.includes(e.gc.kind) && e.gc.from
+        && (!e.gc.status || e.gc.status === 'canon'));
+    const fixed = all.filter(([, e]) => e.gc.kind === 'fixed');
+    const near = all.filter(([, e]) => e.gc.kind !== 'fixed' && Math.abs((Number(String(e.gc.from).slice(0, 4)) || 0) - year) <= 3);
+    const row = ([, e]) => {
+        const x = e.gc;
+        const bits = [x.to ? `${x.from}…${x.to}` : x.from, x.who?.length ? `кто: ${x.who.join(', ')}` : '',
+            x.secret ? `тайна${x.knows ? `; знают: ${Object.entries(x.knows).map(([id, sp]) => `${id} с ${sp.map(s => s.from).join('/')}`).join(', ')}` : ''}` : ''];
+        return `- ${cleanTitle(e.comment)} (${bits.filter(Boolean).join('; ')})${x.kind === 'fixed' ? '' : `: ${String(e.content || '').replace(/\s+/g, ' ').slice(0, 220)}`}`;
+    };
+    const system = 'Ты — Ревизор Священного таймлайна (служба надзора за временем): сверяешь новое событие ролевой истории с её каноном — '
+        + 'Хроникой мира. Канон решает автор, ты только находишь расхождения. Ответь только JSON: {"verdict":"ok" или "nexus",'
+        + '"why":"коротко, по-русски","conflicts":[{"with":"название записи Хроники","what":"в чём расхождение"}],'
+        + '"suggest":"как вписать без поломки — или что подрезать"}. nexus — если событие противоречит фиксированной точке, дате, '
+        + 'тому, кто где и жив ли, или знанию (кто что знает и с какого времени). Подробности сцены, которых в Хронике просто нет, — '
+        + 'не расхождение.';
+    const user = [`Эпоха: ${era?.label || era?.id || '?'}. Дата события: ${fmtDate(at)}.`,
+        `Новое событие (память каноничного чата): ${cleanTitle(entry.comment)}`,
+        g.who?.length ? `Кто был: ${g.who.join(', ')}` : '', String(entry.content || '').slice(0, 3000),
+        '', 'Канон — фиксированные точки:', ...fixed.map(row),
+        '', 'Канон — события рядом по времени (±3 года):', ...near.map(row)].filter(s => s !== null && s !== undefined).join('\n');
+    return [{ role: 'system', content: system }, { role: 'user', content: user }];
+}
+
+/** Ответ Ревизора → правка подзаписи (review / nexus). */
+export function applyReview(entry, text) {
+    const s = String(text || '');
+    const a = s.indexOf('{');
+    const b = s.lastIndexOf('}');
+    let j = null;
+    try { j = a >= 0 && b > a ? JSON.parse(s.slice(a, b + 1)) : null; } catch { j = null; }
+    if (!j || !['ok', 'nexus'].includes(j.verdict)) throw new Error('Ревизор ответил не по форме');
+    entry.gc.review = { verdict: j.verdict, why: String(j.why || '').slice(0, 400), suggest: String(j.suggest || '').slice(0, 400),
+        conflicts: Array.isArray(j.conflicts) ? j.conflicts.slice(0, 5).map(c => ({ with: String(c?.with || ''), what: String(c?.what || '') })) : [],
+        at: new Date().toISOString().slice(0, 10) };
+    if (j.verdict === 'nexus') {
+        entry.gc.status = 'nexus';
+        entry.gc.nexus = [{ note: entry.gc.review.why, suggest: entry.gc.review.suggest, refs: entry.gc.review.conflicts.map(c => c.with) }];
+    } else if (entry.gc.status === 'nexus') {
+        entry.gc.status = 'review';
+    }
+    return j.verdict;
 }
 
 // ───────────── контракт для расширок ─────────────
@@ -1279,6 +1474,11 @@ async function onChatChanged({ reset = true } = {}) {
     }
     if (ctx().getCurrentChatId?.() === chatId) {
         try { await publish(data); } catch (e) { console.warn(TAG, 'снимок для расширок не разослан', e); }
+        if (reset) {
+            await refreshCanon();
+            await refreshDrafts();
+            setTimeout(paintStrazh, 600);
+        }
     }
     renderStatus();
     if (!data || !era || !explicit || ctx().getCurrentChatId?.() !== chatId) return;
@@ -1322,6 +1522,7 @@ async function onGenerationStarted() {
     try {
         r = await resolve();
         await publish(r.data);   // в группе на каждом ходу свой говорящий
+        await refreshCanon(r);   // строки «Канон» для Стража — Летописец Life спросит после поста
     } catch (e) {
         console.warn(TAG, 'снимок для расширок не разослан', e);
     }
@@ -1473,6 +1674,13 @@ function renderSettings() {
             <span>«Кто есть кто» в промпте</span></label>
           <label class="checkbox_label"><input type="checkbox" id="sacred_timeline_chron" ${s.chronicle ? 'checked' : ''}>
             <span>Хроника под дату и фиксированные точки впереди</span></label>
+          <label class="checkbox_label"><input type="checkbox" id="sacred_timeline_strazh" ${s.strazh ? 'checked' : ''}>
+            <span>Страж канона — графа в Летописце Life, 🚩 под постом</span></label>
+          <label class="checkbox_label"><input type="checkbox" id="sacred_timeline_chronist" ${s.chronist ? 'checked' : ''}>
+            <span>Хронист — память канон-чата эпохи → подзаписи Хроники 🟡</span></label>
+          <label class="sacred-timeline-row"><span>Ревизор — профиль:</span>
+            <select id="sacred_timeline_reviser" class="text_pole"></select></label>
+          <div id="sacred_timeline_canon"></div>
           <div class="menu_button" id="sacred_timeline_check">Проверить этот чат</div>
           <small>v${VERSION} · /era — эпоха чата</small>
         </div>
@@ -1494,7 +1702,18 @@ function renderSettings() {
         renderStatus();
     });
     $('#sacred_timeline_check').on('click', () => { onChatChanged({ reset: false }).catch(e => console.warn(TAG, e)); });
+    $('#sacred_timeline_strazh').on('change', function () { settings().strazh = this.checked; ctx().saveSettingsDebounced(); refreshCanon(); });
+    $('#sacred_timeline_chronist').on('change', function () { settings().chronist = this.checked; ctx().saveSettingsDebounced(); });
+    const fillProfiles = () => {
+        const list = ctx().extensionSettings?.connectionManager?.profiles || [];
+        const cur = settings().reviser || '';
+        $('#sacred_timeline_reviser').html(['<option value="">— не выбран —</option>',
+            ...list.map(p => `<option value="${esc(p.name)}" ${p.name === cur || p.id === cur ? 'selected' : ''}>${esc(p.name)}</option>`)].join(''));
+    };
+    fillProfiles();
+    $('#sacred_timeline_reviser').on('focus', fillProfiles).on('change', function () { settings().reviser = this.value; ctx().saveSettingsDebounced(); });
     renderStatus();
+    renderCanon();
 }
 
 function eraReport() {
@@ -1502,6 +1721,196 @@ function eraReport() {
     if (!current.era) return 'Эпоха этого чата в Реестре не отмечена.';
     const date = current.date ? `, сюжет — ${fmtDate(current.date)}` : '';
     return `Эпоха ${current.era.id} — ${current.era.label || ''}${current.explicit ? '' : ' (по умолчанию)'}${date}.`;
+}
+
+// ───────────── канон: живая часть (Летописец Life, флажки, очередь) ─────────────
+
+/** Строки «Канон» на этот чат — для графы Стража в Летописце (он спрашивает синхронно, считаем заранее). */
+async function refreshCanon(r) {
+    lastCanon = null;
+    try {
+        const { data, era, explicit, date, world } = r || await resolve();
+        const w = data ? worldRecord(data) : null;
+        if (!settings().strazh || !data || !era || !explicit || !world || !w?.chronicle) return;
+        const book = await ctx().loadWorldInfo?.(w.chronicle);
+        const cast = (lastContext?.cast || []).map(x => x.identity);
+        if (lastContext?.persona?.identity) cast.push(lastContext.persona.identity);
+        const input = canonBrief({ data, era, date, book, cast });
+        if (input) lastCanon = { input, chatId: current.chatId };
+    } catch (e) {
+        console.warn(TAG, 'строки «Канон» для Стража пропущены', e);
+    }
+}
+
+/** Очередь подзаписей этой эпохи (🟡 и ⚠️). */
+async function refreshDrafts() {
+    lastDrafts = [];
+    try {
+        const { data, era, explicit } = await resolve();
+        const w = data ? worldRecord(data) : null;
+        if (data && era && explicit && w?.chronicle) {
+            const book = await ctx().loadWorldInfo?.(w.chronicle);
+            lastDrafts = Object.entries(book?.entries || {})
+                .filter(([, e]) => DRAFT_OPEN.includes(e?.gc?.status) && String(e.gc.src?.era || '') === String(era.id))
+                .map(([k, e]) => ({ uid: Number(e.uid ?? k), title: cleanTitle(e.comment), status: e.gc.status, from: e.gc.from,
+                    who: (e.gc.who || []).map(id => records(data, 'identity').find(g => g.id === id)?.name || id),
+                    review: e.gc.review || null }))
+                .sort((a, b) => String(b.from).localeCompare(String(a.from)));
+        }
+    } catch (e) {
+        console.warn(TAG, 'очередь Хроники не прочиталась', e);
+    }
+    renderCanon();
+}
+
+function draftHtml(d) {
+    const rv = d.review;
+    const note = rv ? `<div class="st-draft-n st-draft-n--${rv.verdict}">${rv.verdict === 'ok' ? 'Ревизор: в рамках' : '⚠️ Нексус'}${rv.why ? ` — ${esc(rv.why)}` : ''}${rv.suggest ? `<br><i>${esc(rv.suggest)}</i>` : ''}</div>` : '';
+    const acts = d.status === 'nexus'
+        ? [['pruned', '✂ Подрезать'], ['canon', '✓ Вписать в таймлайн'], ['own', '⑂ Своё']]
+        : [['revise', 'Ревизор'], ['canon', '✓ Вписать'], ['memo', '○ Только память'], ['own', '⑂ Своё'], ['pruned', '✂ Подрезать']];
+    return `<div class="st-draft" data-uid="${d.uid}">
+      <div class="st-draft-t">${DRAFT_MARK[d.status] || ''} ${esc(d.title)}</div>
+      ${d.who.length ? `<div class="st-draft-m">кто: ${esc(d.who.join(', '))}</div>` : ''}
+      ${note}
+      <div class="st-draft-b">${acts.map(([a, t]) => `<button class="menu_button st-draft-act" data-act="${a}">${t}</button>`).join('')}</div>
+    </div>`;
+}
+
+function strazhCount() {
+    const store = ctx().chatMetadata?.[MODULE]?.strazh || {};
+    const chat = ctx().chat || [];
+    let n = 0;
+    chat.forEach((m, i) => { const r = store[strazhKey(m, i)]; if (r && r.flag !== 'ok' && !r.dismissed) n++; });
+    return n;
+}
+
+function canonHtml() {
+    const flags = strazhCount();
+    if (!lastDrafts.length && !flags) return '';
+    const head = `Канон: ${lastDrafts.length ? `на проверке — ${lastDrafts.length}` : 'очередь пуста'}${flags ? ` · 🚩 Страж — ${flags} в этом чате` : ''}`;
+    return `<div class="st-canon"><div class="st-canon-h">${head}</div>${lastDrafts.slice(0, 12).map(draftHtml).join('')}</div>`;
+}
+
+function renderCanon() {
+    if (typeof $ !== 'function') return;
+    $('#sacred_timeline_canon').html(canonHtml());
+    try { globalThis.LifeBridge?.api?.renderSoon?.(); } catch { /* */ }
+}
+
+async function actDraft(uid, act) {
+    const { data, era } = await resolve();
+    const w = data ? worldRecord(data) : null;
+    const c = ctx();
+    if (!w?.chronicle) return;
+    const chron = await c.loadWorldInfo?.(w.chronicle);
+    const entry = Object.values(chron?.entries || {}).find(e => Number(e?.uid) === Number(uid));
+    if (!entry?.gc) return;
+    if (act === 'revise') {
+        const prof = (c.extensionSettings?.connectionManager?.profiles || []).find(p => p.name === settings().reviser || p.id === settings().reviser);
+        if (!prof) { window.toastr?.warning('Выбери профиль Ревизора: Расширения → Священный таймлайн', 'Ревизор'); return; }
+        if (!c.ConnectionManagerRequestService?.sendRequest) { window.toastr?.warning('В таверне нет Connection Manager', 'Ревизор'); return; }
+        window.toastr?.info('Сверяю с Хроникой…', 'Ревизор');
+        const r = await c.ConnectionManagerRequestService.sendRequest(prof.id, reviserPrompt(entry, chron, era), 900, {});
+        const verdict = applyReview(entry, typeof r === 'string' ? r : (r?.content ?? ''));
+        await c.saveWorldInfo?.(w.chronicle, chron, true);
+        window.toastr?.[verdict === 'ok' ? 'success' : 'warning'](verdict === 'ok' ? 'В рамках канона' : 'Нексус — реши: подрезать, вписать или своё', 'Ревизор');
+        await refreshDrafts();
+        return;
+    }
+    const mem = decideDraft(entry, act);
+    if (!mem) return;
+    await c.saveWorldInfo?.(w.chronicle, chron, true);
+    const [book, muid] = String(entry.gc.src?.stmb || '').split('#');
+    if (book && muid !== undefined) {
+        const mb = await c.loadWorldInfo?.(book);
+        const me = Object.values(mb?.entries || {}).find(e => String(e?.uid) === String(muid));
+        if (me?.gc) {
+            const was = me.gc.status;
+            me.gc.status = mem.memoryStatus;
+            if (mem.disable) me.disable = true;
+            else if (was === 'pruned') me.disable = false;
+            await c.saveWorldInfo?.(book, mb, true);
+        }
+    }
+    const said = { canon: 'вписано в таймлайн', memo: 'только память', own: 'своё — ветка', pruned: 'подрезано' }[act];
+    window.toastr?.info(`${cleanTitle(entry.comment)} — ${said}`, 'Канон');
+    await refreshDrafts();
+}
+
+/** 🚩 под постами, где Страж увидел поломку канона. */
+function paintStrazh() {
+    if (typeof document === 'undefined') return;
+    const c = ctx();
+    const store = c.chatMetadata?.[MODULE]?.strazh || {};
+    for (const el of document.querySelectorAll('#chat .mes[mesid]')) {
+        const i = Number(el.getAttribute('mesid'));
+        const m = c.chat?.[i];
+        const key = m ? strazhKey(m, i) : '';
+        const rec = key ? store[key] : null;
+        const old = el.querySelector('.st-strazh');
+        if (!rec || rec.flag === 'ok' || rec.dismissed) { old?.remove(); continue; }
+        if (old?.dataset.key === key) continue;
+        old?.remove();
+        const box = document.createElement('div');
+        box.className = `st-strazh st-strazh--${rec.flag}`;
+        box.dataset.key = key;
+        box.innerHTML = `<div class="st-strazh-h">🚩 Страж: ${esc(rec.what || 'расходится с каноном')}</div>
+          <div class="st-strazh-d">${rec.fix ? `Как поправить: ${esc(rec.fix)}<br>` : ''}<span class="st-strazh-ok">✕ так задумано</span></div>`;
+        (el.querySelector('.mes_text')?.parentElement || el).appendChild(box);
+    }
+}
+
+function onStrazh(i, j, m) {
+    const rec = strazhRecord(j);
+    const c = ctx();
+    if (!rec || c.chat?.[i] !== m) return;
+    const store = strazhStore(c.chatMetadata);
+    store[strazhKey(m, i)] = rec;
+    const keys = Object.keys(store);
+    if (keys.length > 300) for (const k of keys.slice(0, keys.length - 300)) delete store[k];
+    c.saveMetadata?.();
+    paintStrazh();
+    renderCanon();
+    if (rec.flag === 'break') { try { window.toastr?.warning(esc(rec.what), '🚩 Страж: канон сломан'); } catch { /* */ } }
+}
+
+const lifeModule = {
+    id: 'timeline',
+    chron() {
+        if (!settings().strazh || !lastCanon?.input || lastCanon.chatId !== current.chatId) return null;
+        return { key: '"canon": {"flag": "ok"}', rule: STRAZH_RULE, input: lastCanon.input, tokens: 120 };
+    },
+    afterPost(i, j, m) { onStrazh(i, j, m); },
+    sceneHtml() { return canonHtml(); },
+};
+
+let lifeJoined = false;
+function joinLife() {
+    if (lifeJoined) return true;
+    const bridge = globalThis.LifeBridge;
+    if (!bridge?.register) return false;
+    lifeJoined = bridge.register(lifeModule) || (bridge.modules?.() || []).includes(lifeModule.id);
+    return lifeJoined;
+}
+
+function bindCanonUi() {
+    if (typeof $ !== 'function') return;
+    $(document).on('click', '.st-draft-act', function () {
+        const uid = $(this).closest('.st-draft').data('uid');
+        const act = $(this).data('act');
+        $(this).prop('disabled', true);
+        actDraft(uid, act).catch(e => { console.warn(TAG, e); window.toastr?.error(esc(String(e?.message || e)), 'Канон'); })
+            .finally(() => $(this).prop('disabled', false));
+    });
+    $(document).on('click', '.st-strazh-h', function () { $(this).closest('.st-strazh').toggleClass('open'); });
+    $(document).on('click', '.st-strazh-ok', function () {
+        const key = $(this).closest('.st-strazh').data('key');
+        const store = strazhStore(ctx().chatMetadata);
+        if (store[key]) { store[key].dismissed = true; ctx().saveMetadata?.(); }
+        paintStrazh();
+        renderCanon();
+    });
 }
 
 function registerSlash() {
@@ -1538,6 +1947,18 @@ if (typeof jQuery === 'function') {
         // STMB сохранил память сцены — разметить дату и кто знает
         if (eventTypes.WORLDINFO_UPDATED) eventSource.on(eventTypes.WORLDINFO_UPDATED, safe((name, book) => tagEraMemory(name, book)));
         registerSlash();
+        bindCanonUi();
+        // Life грузится рядом — подключаем Стража, как только появится её мост
+        if (!joinLife()) {
+            let t = 0;
+            const iv = setInterval(() => { if (joinLife() || ++t > 60) clearInterval(iv); }, 1000);
+            iv?.unref?.();   // вне браузера (тесты) таймер не держит процесс
+        }
+        const paintSoon = () => setTimeout(paintStrazh, 300);
+        for (const ev of ['CHARACTER_MESSAGE_RENDERED', 'MORE_MESSAGES_LOADED', 'MESSAGE_SWIPED', 'MESSAGE_EDITED', 'MESSAGE_UPDATED']) {
+            if (eventTypes[ev]) eventSource.on(eventTypes[ev], paintSoon);
+        }
+        if (eventTypes.APP_READY) eventSource.on(eventTypes.APP_READY, () => { joinLife(); paintSoon(); });
         window.SacredTimeline = {
             version: VERSION,
             /** Снимок для расширок (копия) или null, если чат вне мира. Меняется — событие «sacred-timeline:changed». */

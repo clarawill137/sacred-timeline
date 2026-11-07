@@ -2,3 +2,21 @@
 .sacred-timeline-status { font-size: 0.9em; line-height: 1.4; margin: 4px 0 8px; }
 .sacred-timeline-status div { margin: 2px 0; }
 .sacred-timeline-settings small { opacity: 0.6; display: block; margin-top: 6px; }
+.sacred-timeline-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+.sacred-timeline-row select { flex: 1; min-width: 0; }
+/* канон: очередь Хроники и флажки Стража */
+.st-canon { margin: 8px 0; border-top: 1px solid var(--SmartThemeBorderColor, #444); padding-top: 6px; }
+.st-canon-h { font-weight: 600; margin-bottom: 6px; }
+.st-draft { border: 1px solid var(--SmartThemeBorderColor, #444); border-radius: 8px; padding: 6px 8px; margin: 6px 0; }
+.st-draft-t { font-weight: 600; }
+.st-draft-m { opacity: 0.75; font-size: 0.9em; }
+.st-draft-n { font-size: 0.9em; margin-top: 4px; }
+.st-draft-n--nexus { color: #e0a040; }
+.st-draft-b { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.st-draft-b .menu_button { margin: 0; padding: 3px 8px; font-size: 0.85em; width: auto; }
+.st-strazh { margin: 6px 0 2px; padding: 4px 8px; border-left: 3px solid #e0a040; border-radius: 4px; font-size: 0.85em;
+  background: rgba(224, 160, 64, 0.08); cursor: pointer; }
+.st-strazh--break { border-left-color: #d0453b; background: rgba(208, 69, 59, 0.1); }
+.st-strazh-d { display: none; margin-top: 4px; opacity: 0.85; }
+.st-strazh.open .st-strazh-d { display: block; }
+.st-strazh-ok { text-decoration: underline; cursor: pointer; opacity: 0.8; }
