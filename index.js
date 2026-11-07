@@ -1,15 +1,17 @@
-// Священный таймлайн — ядро, v0.5.
+// Священный таймлайн — ядро, v0.6.
 // Узнаёт эпоху и дату открытого чата по Реестру мира (лорбук на сервере, имя кончается на «Реестр») и:
 //  • пускает в промпт только лорбуки и записи своей эпохи (книги по эпохам, записи Хроники из будущего — вон);
 //  • тайны — только тем, кто их знает (gc.knows говорящего на дату), и не раньше, чем персона их прожила (gc.personal);
 //  • правит персону прямо в промпте под эпоху (возраст, «сейчас», внешность) — сама персона в ST не меняется;
 //  • убирает из Закулисья тех, кого в этой эпохе нет: умер, пыль, лёд, ещё не родился;
 //  • «кто есть кто» — короткая шпаргалка эпохи на дату сюжета в промпт (строки эпохи + кого здесь нет и почему);
-//  • книги эпохи (era.lore) — сам подключает их в чатах отмеченной эпохи, без глобальных настроек ST.
+//  • книги эпохи (era.lore) — сам подключает их в чатах отмеченной эпохи, без глобальных настроек ST;
+//  • аватар персоны по эпохе: у обличья эпохи свой файл в User Avatars — ядро заводит персону-двойника
+//    (то же имя и описание) и переключает на неё в чатах эпохи; уходя из них — возвращает базовую.
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true };
 const WHO_KEY = 'sacred_timeline_who';
@@ -24,6 +26,8 @@ let lastLore = null;     // что срезали в последний раз
 let lastPersona = null;  // сколько правок персоны применили в последний раз
 let lastWho = null;      // сколько строк «кто есть кто» ушло в промпт в последний раз
 let lastBooks = null;    // книги эпохи: { added: [имена], missing: [имена], entries: n }
+let lastAvatar = null;   // аватар персоны: { avatar, base, missing, switched }
+let switchingPersona = false;
 
 function settings() {
     const ext = ctx().extensionSettings;
@@ -358,6 +362,94 @@ export function personaIdentity(data) {
     return records(data, 'identity').find(g => g.persona)?.id || null;
 }
 
+/** Аватар персоны на эпоху: у обличья эпохи (era.persona) свой файл — иначе базовый аватар личности-персоны. */
+export function eraPersonaAvatar(data, era) {
+    const id = records(data, 'identity').find(g => g.persona);
+    if (!id) return null;
+    const slice = (id.slices || []).find(sl => sl.id === era?.persona);
+    return { base: id.persona, target: slice?.persona || id.persona };
+}
+
+/**
+ * Какой аватар персоны нужен этому чату. В отмеченном чате — аватар эпохи. В неотмеченном трогаем только
+ * своих двойников (mine): с них возвращаем на базовый; чужие персоны не трогаем. null — ничего не делать.
+ */
+export function wantedPersona(av, explicit, current, mine = []) {
+    if (!av?.base) return null;
+    const target = explicit ? av.target : (mine.includes(current) ? av.base : null);
+    return target && target !== current ? target : null;
+}
+
+/** Двойник базовой персоны под аватар эпохи: то же имя и описание, без привязок к персонажам. */
+export function clonePersona(pu, base, avatar) {
+    const desc = pu?.persona_descriptions?.[base];
+    if (!pu?.personas?.[base] || !desc) return false;
+    pu.personas[avatar] = pu.personas[base];
+    pu.persona_descriptions[avatar] = { ...JSON.parse(JSON.stringify(desc)), connections: [] };
+    return true;
+}
+
+let personasModule = null;
+/** Функции персон ST (setUserAvatar, user_avatar). В тестах подменяется. */
+export function _setPersonasApi(api) { personasModule = api; }
+async function personasApi() {
+    if (personasModule) return personasModule;
+    for (const path of ['../../../personas.js', '/scripts/personas.js']) {
+        try {
+            const m = await import(path);
+            if (typeof m?.setUserAvatar === 'function') { personasModule = m; return m; }
+        } catch { /* следующий путь */ }
+    }
+    return null;
+}
+
+async function userAvatarFiles() {
+    try {
+        const c = ctx();
+        const r = await fetch('/api/avatars/get', { method: 'POST', headers: c.getRequestHeaders?.() || {} });
+        if (!r.ok) return null;
+        const list = await r.json();
+        return Array.isArray(list) ? list : null;
+    } catch { return null; }
+}
+
+/** Переключить персону под эпоху чата (только при смене чата). */
+async function syncPersonaAvatar(data, era, explicit) {
+    if (!settings().persona || switchingPersona || !data || !era) return;
+    const av = eraPersonaAvatar(data, era);
+    if (!av) return;
+    const api = await personasApi();
+    if (!api) return;
+    const st = settings();
+    const mine = Array.isArray(st.eraPersonas) ? st.eraPersonas : (st.eraPersonas = []);
+    const current = api.user_avatar;
+    const target = wantedPersona(av, explicit, current, mine);
+    lastAvatar = { avatar: current, base: av.base, missing: null, switched: false };
+    if (!target) return;
+    const files = await userAvatarFiles();
+    if (files && !files.includes(target)) { lastAvatar.missing = target; return; }
+    const c = ctx();
+    const pu = c.powerUserSettings;
+    if (target !== av.base && pu && (!pu.personas?.[target] || mine.includes(target))) {
+        // двойник держится в ногу с базовой персоной: правишь её — двойник обновится при следующем входе
+        if (clonePersona(pu, av.base, target) && !mine.includes(target)) mine.push(target);
+        c.saveSettingsDebounced?.();
+    }
+    switchingPersona = true;
+    try {
+        await api.setUserAvatar(target, { toastPersonaNameChange: false });
+    } finally {
+        switchingPersona = false;
+    }
+    lastAvatar = { avatar: target, base: av.base, missing: null, switched: true };
+    // ST мог перечитать чат после смены персоны — берём свежие метаданные
+    const fresh = ctx();
+    if (explicit && target !== av.base && fresh.chatMetadata && fresh.chatMetadata.persona !== target) {
+        fresh.chatMetadata.persona = target;   // закрепить за чатом: ST и сам выберет её при следующем входе
+        await fresh.saveMetadata?.();
+    }
+}
+
 // ───────────── кто есть кто ─────────────
 
 /** Строки эпохи на дату: у строки бывают from/to (как у записей Хроники) и speaker — только на его ходу. */
@@ -480,9 +572,13 @@ async function onChatChanged({ reset = true } = {}) {
         lastPersona = null;
         lastWho = null;
         lastBooks = null;
+        lastAvatar = null;
         ctx().setExtensionPrompt?.(WHO_KEY, '', IN_CHAT, WHO_DEPTH, false, ROLE_SYSTEM);
     }
     const { data, era, explicit, date, md } = await resolve();
+    if (reset && ctx().getCurrentChatId?.() === chatId) {
+        try { await syncPersonaAvatar(data, era, explicit); } catch (e) { console.warn(TAG, 'аватар персоны не переключён', e); }
+    }
     renderStatus();
     if (!data || !era || !explicit || ctx().getCurrentChatId?.() !== chatId) return;
     const removed = await guardBackstage(data, era, date, md);
@@ -601,6 +697,8 @@ function statusLines() {
         out.push('Лорбуки: покажу после первой генерации.');
     }
     if (lastPersona !== null) out.push(lastPersona ? `Персона: срез эпохи — правок ${lastPersona}` : 'Персона: без правок');
+    if (lastAvatar?.missing) out.push(`Аватар персоны эпохи «${esc(lastAvatar.missing)}» не найден в User Avatars — оставила как есть`);
+    else if (lastAvatar?.avatar && lastAvatar.avatar !== lastAvatar.base) out.push(`Аватар персоны: ${esc(lastAvatar.avatar)} (эпоха)`);
     if (!settings().who) out.push('Кто есть кто: выключено');
     else if (lastWho !== null) out.push(lastWho ? `Кто есть кто: ${lastWho} ${plural(lastWho, 'строка', 'строки', 'строк')} в промпте` : 'Кто есть кто: для этой эпохи нет');
     return out;

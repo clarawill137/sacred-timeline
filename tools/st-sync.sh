@@ -7,7 +7,8 @@
 #   st-sync status  — что сейчас происходит
 #   st-sync update  — обновить сам st-sync с GitHub
 #
-# Синкаются только: worlds/*.json, OpenAI Settings/*.json, groups/*.json, characters/*.png.
+# Синкаются только: worlds/*.json, OpenAI Settings/*.json, groups/*.json, characters/*.png,
+# User Avatars/*.png (аватарки персон: картинки, без настроек персон).
 # Из settings.json уезжает только выжимка (_export/settings-safe.json): персоны, привязки
 # лорбуков, теги. Ключи API (secrets.json, токены расширений) и бэкапы никогда не уезжают.
 # Чаты: всегда уезжает только их список (_export/chats-index.json). Сами чаты — лишь те, что
@@ -25,7 +26,7 @@ KEY="${ST_SYNC_KEY:-$HOME/.ssh/st_data_key}"
 HOST_ALIAS="github-st-data"
 REMOTE="${ST_SYNC_REMOTE:-git@${HOST_ALIAS}:${REPO}.git}"
 BRANCH="main"
-SPECS=("worlds|*.json" "OpenAI Settings|*.json" "groups|*.json" "characters|*.png")
+SPECS=("worlds|*.json" "OpenAI Settings|*.json" "groups|*.json" "characters|*.png" "User Avatars|*.png")
 EXPORT_DIR="_export"   # только для чтения Claude; на сервер никогда не применяется
 CHATS_DIR="_chats"     # снимки запрошенных чатов — только для чтения Claude
 REQUEST_FILE="_request/chats.txt"
