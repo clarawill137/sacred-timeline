@@ -13,7 +13,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.8.2';
+const VERSION = '0.8.3';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true, chronicle: true };
 const WHO_KEY = 'sacred_timeline_who';
@@ -372,7 +372,9 @@ export function scopeFor(data, era, date, c) {
  * Выключенные записи судим как включённые: ST их сам не вставит, а поиск — может.
  */
 export function visibleEntries(entries, world, scope, books) {
-    return (entries || []).filter(e => e && judgeEntry({ ...e, world, disable: false }, scope, books) !== 'drop');
+    const at = scope?.date || scope?.eraFrom || null;
+    return (entries || []).filter(e => e && judgeEntry({ ...e, world, disable: false }, scope, books) !== 'drop')
+        .map(e => entryAt(e, at).entry);
 }
 
 /** Память прошлых эпох — только размеченные записи (дата и кто знает); дальше их режет общий фильтр. */
@@ -391,8 +393,53 @@ async function joinHistory(payload, data, era) {
     return out;
 }
 
+// ───────────── отрывки по дате ─────────────
+
+const SEG_DATE = '(\\d{4}(?:-\\d{2}){0,2})';
+// «с» — и кириллицей, и латиницей (так набирается на телефоне)
+const SEG_RE = new RegExp(`⟦\\s*(?:(?:с|c|from)\\s+${SEG_DATE}(?:\\s+(?:по|до|to|until)\\s+${SEG_DATE})?|(?:до|по|until|to)\\s+${SEG_DATE})\\s*:[ \\t]?([\\s\\S]*?)⟧`, 'g');
+
+/**
+ * Отрывки внутри текста записи: ⟦с 2018-04: …⟧ — видно с этой даты, ⟦до 2020-06: …⟧ — по эту дату включительно
+ * (как to у состояния), ⟦с 2016-04 по 2023-10: …⟧ — внутри отрезка; можно и from / until / to. Одна запись на все
+ * годы, а знание, которого на эту дату ещё нет (или уже нет), — вон из текста; там, где оно есть, текст тот же, что
+ * без скобок. Без даты — всё как есть, только без скобок. Возвращает { text, hidden } — сколько отрывков скрыто.
+ */
+export function atDate(text, at) {
+    const s = String(text ?? '');
+    if (!s.includes('⟦')) return { text: s, hidden: 0 };
+    const when = at ? String(at) : '';
+    let out = '';
+    let last = 0;
+    let hidden = 0;
+    SEG_RE.lastIndex = 0;
+    for (let m; (m = SEG_RE.exec(s));) {
+        const [all, since, till1, till2, body] = m;
+        const till = till1 || till2;
+        const show = !when
+            || ((!since || since <= when) && (!till || !(when > till && !when.startsWith(till))));
+        out += s.slice(last, m.index);
+        last = m.index + all.length;
+        if (show) { out += body; continue; }
+        hidden++;
+        // скрытый отрывок не оставляет двойных пробелов, пробела перед знаком препинания и в начале строки
+        const next = s.charAt(last);
+        if (/[ \t]$/.test(out) && (next === '' || /[\s,.;:!?)\]»…]/.test(next))) out = out.replace(/[ \t]+$/, '');
+        else if ((out === '' || out.endsWith('\n')) && /[ \t]/.test(next)) while (/[ \t]/.test(s.charAt(last))) last++;
+    }
+    return { text: out + s.slice(last), hidden };
+}
+
+/** Текст записи на дату (копия записи, если что-то поменялось) — для промпта и для расширок, читающих книги. */
+function entryAt(entry, at) {
+    if (typeof entry?.content !== 'string' || !entry.content.includes('⟦')) return { entry, hidden: 0 };
+    const r = atDate(entry.content, at);
+    return { entry: { ...entry, content: r.text }, hidden: r.hidden };
+}
+
 export function filterLore(payload, scope, books) {
-    const stats = { dropped: 0, enabled: 0, byBook: {} };
+    const stats = { dropped: 0, enabled: 0, trimmed: 0, byBook: {} };
+    const at = scope?.date || scope?.eraFrom || null;
     for (const key of LORE_KEYS) {
         const arr = payload?.[key];
         if (!Array.isArray(arr)) continue;
@@ -404,9 +451,16 @@ export function filterLore(payload, scope, books) {
                     stats.byBook[arr[i].world] = (stats.byBook[arr[i].world] || 0) + 1;
                 }
                 arr.splice(i, 1);
-            } else if (verdict === 'enable') {
+                continue;
+            }
+            if (verdict === 'enable') {
                 arr[i].disable = false;
                 stats.enabled++;
+            }
+            const r = entryAt(arr[i], at);
+            if (r.entry !== arr[i]) {
+                arr[i] = r.entry;
+                if (r.hidden && !r.entry.disable) stats.trimmed++;
             }
         }
     }
@@ -1354,7 +1408,7 @@ function statusLines() {
     }
     if (lastLore) {
         const books = Object.entries(lastLore.byBook).map(([b, n]) => `${esc(b)}: ${n}`).join('; ');
-        out.push(`Лорбуки: скрыто ${lastLore.dropped}${books ? ` (${books})` : ''}${lastLore.enabled ? `, включено срезов эпохи: ${lastLore.enabled}` : ''} · говорящий: ${lastLore.speaker ? esc(lastLore.speaker) : 'не опознан — тайны скрыты'}`);
+        out.push(`Лорбуки: скрыто ${lastLore.dropped}${books ? ` (${books})` : ''}${lastLore.enabled ? `, включено срезов эпохи: ${lastLore.enabled}` : ''}${lastLore.trimmed ? `, отрывков по дате срезано в ${lastLore.trimmed}` : ''} · говорящий: ${lastLore.speaker ? esc(lastLore.speaker) : 'не опознан — тайны скрыты'}`);
     } else {
         out.push('Лорбуки: покажу после первой генерации.');
     }
