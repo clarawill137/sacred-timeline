@@ -1,4 +1,4 @@
-// Священный таймлайн — ядро, v0.6.
+// Священный таймлайн — ядро, v0.7.
 // Узнаёт эпоху и дату открытого чата по Реестру мира (лорбук на сервере, имя кончается на «Реестр») и:
 //  • пускает в промпт только лорбуки и записи своей эпохи (книги по эпохам, записи Хроники из будущего — вон);
 //  • тайны — только тем, кто их знает (gc.knows говорящего на дату), и не раньше, чем персона их прожила (gc.personal);
@@ -7,11 +7,13 @@
 //  • «кто есть кто» — короткая шпаргалка эпохи на дату сюжета в промпт (строки эпохи + кого здесь нет и почему);
 //  • книги эпохи (era.lore) — сам подключает их в чатах отмеченной эпохи, без глобальных настроек ST;
 //  • аватар персоны по эпохе: у обличья эпохи свой файл в User Avatars — ядро заводит персону-двойника
-//    (то же имя, описание — уже с правками эпохи) и переключает на неё в чатах эпохи; уходя — возвращает базовую.
+//    (то же имя, описание — уже с правками эпохи) и переключает на неё в чатах эпохи; уходя — возвращает базовую;
+//  • расширки: SacredTimeline.context() и событие «sacred-timeline:changed» (мир, эпоха, дата, говорящий, состав,
+//    персона, режимы); режимы расширок по эпохам из Реестра — глушит их промпт и прячет кнопки, настроек не трогает.
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.6.3';
+const VERSION = '0.7.0';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true };
 const WHO_KEY = 'sacred_timeline_who';
@@ -559,6 +561,189 @@ async function resolve() {
     return { data, era, explicit, date, md };
 }
 
+// ───────────── контракт для расширок ─────────────
+//
+// Ядро не лезет в настройки чужих расширок. Три рычага:
+//  • context() + событие «sacred-timeline:changed» — свои расширки сами подстраиваются под эпоху и облик;
+//  • режимы расширок по эпохам в Реестре (gc.type "ext" — каталог, era.ext — режимы): off — промпт расширки
+//    глушится и её кнопки прячутся в чатах эпохи, quiet — только промпт, hidden — только кнопки;
+//  • body[data-st-era] / [data-st-year] — темы и CSS могут смотреть на эпоху без кода.
+
+/** Обличье по id обличья: { identity, slice }. */
+export function sliceById(data, sliceId) {
+    if (!sliceId) return null;
+    for (const g of records(data, 'identity')) {
+        const s = (g.slices || []).find(x => x.id === sliceId);
+        if (s) return { identity: g, slice: s };
+    }
+    return null;
+}
+
+/** Обличье личности: по карточке, иначе по дате. */
+export function sliceOf(data, identityId, { avatar, date } = {}) {
+    const g = records(data, 'identity').find(x => x.id === identityId);
+    const slices = g?.slices || [];
+    return (avatar && slices.find(s => s.card === avatar)) || (date && slices.find(s => covers(s, date))) || null;
+}
+
+const MUTE_MODES = ['off', 'quiet'];
+const HIDE_MODES = ['off', 'hidden'];
+
+/** Режимы расширок в эпохе: из каталога (default, иначе 'on'), поверх — era.ext. Только в отмеченных эпохах. */
+export function extModes(data, era, explicit) {
+    const out = {};
+    for (const x of records(data, 'ext')) if (x.id) out[x.id] = String(x.default || 'on');
+    if (explicit && era?.ext && typeof era.ext === 'object') {
+        for (const [id, mode] of Object.entries(era.ext)) out[id] = String(mode);
+    }
+    return out;
+}
+
+/** Ключи extension_prompts расширок, которые в этих режимах глушатся. */
+export function mutedKeys(data, modes) {
+    const keys = new Set();
+    for (const x of records(data, 'ext')) {
+        if (MUTE_MODES.includes(modes?.[x.id])) for (const k of x.prompts || []) if (k) keys.add(String(k));
+    }
+    return keys;
+}
+
+/** Все ключи промптов из каталога — под охрану (охрана прозрачна, пока ключ не заглушён). */
+export function catalogKeys(data) {
+    return [...new Set(records(data, 'ext').flatMap(x => x.prompts || []).filter(Boolean).map(String))];
+}
+
+const GUARD = Symbol.for('sacredTimeline.promptGuard');
+
+/**
+ * Поставить охрану на ключи extension_prompts: расширка пишет как обычно, значение хранится целиком, а при
+ * глушении ST читает его пустым — и не вставляет. Ключ, которого ещё нет, берём под охрану, когда появится.
+ * Настройки расширки не трогаются — уйдёшь из эпохи, всё вернётся само.
+ */
+export function guardPrompts(store, keys, isMuted) {
+    let armed = 0;
+    if (!store || typeof store !== 'object') return armed;
+    for (const key of keys || []) {
+        const d = Object.getOwnPropertyDescriptor(store, key);
+        if (!d || !d.configurable) continue;
+        if (d.get) continue;                       // уже под охраной (или чужой геттер — не трогаем)
+        let value = d.value;
+        const get = () => (value && typeof value === 'object' && value.value && isMuted(key)) ? { ...value, value: '' } : value;
+        get[GUARD] = true;
+        Object.defineProperty(store, key, { configurable: true, enumerable: true, get, set: v => { value = v; } });
+        armed++;
+    }
+    return armed;
+}
+
+const cssAttr = s => String(s).replace(/["\\]/g, '\\$&');
+
+/** CSS, который прячет кнопки расширок в эпохах, где они выключены. */
+export function policyCss(data) {
+    const exts = Object.fromEntries(records(data, 'ext').filter(x => x.id).map(x => [x.id, x]));
+    const sels = [];
+    for (const era of records(data, 'era')) {
+        for (const [id, mode] of Object.entries(era.ext || {})) {
+            if (!HIDE_MODES.includes(String(mode))) continue;
+            for (const sel of exts[id]?.ui || []) {
+                if (sel && !/[{}]/.test(sel)) sels.push(`body[data-st-era="${cssAttr(era.id)}"] ${sel}`);
+            }
+        }
+    }
+    return sels.length ? `${sels.join(',\n')} { display: none !important; }` : '';
+}
+
+/** Снимок для расширок: мир, эпоха, дата, кто говорит, состав, персона, режимы расширок. null — чат вне мира. */
+export function buildContext(data, cur, c) {
+    const era = cur?.era;
+    if (!data || !era) return null;
+    const w = worldRecord(data);
+    const short = id => {
+        const hit = sliceById(data, id);
+        return hit ? { identity: hit.identity.id, slice: hit.slice.id, name: hit.identity.name || hit.identity.id,
+            card: hit.slice.card || null } : null;
+    };
+    const ch = c?.characters?.[c?.characterId];
+    const speakerId = speakerOf(data, ch, c?.name2);
+    const sp = speakerId ? sliceOf(data, speakerId, { avatar: ch?.avatar, date: cur.date || era.from }) : null;
+    const pr = sliceById(data, era.persona);
+    return {
+        v: 1,
+        world: w ? { id: w.id || null, name: w.name || null } : null,
+        era: { id: String(era.id), label: era.label || '', from: era.from || null, to: era.to || null,
+            status: era.status || null, memoryBook: era.memoryBook || null, lore: [...(era.lore || [])] },
+        explicit: !!cur.explicit,
+        chatId: cur.chatId || null,
+        date: cur.date || null,
+        dateSource: cur.dateSource || '',
+        speaker: speakerId ? { identity: speakerId, slice: sp?.id || null, avatar: ch?.avatar || null } : null,
+        cast: (era.cast || []).map(short).filter(Boolean),
+        persona: pr ? { identity: pr.identity.id, slice: pr.slice.id, avatar: pr.slice.persona || pr.identity.persona || null } : null,
+        ext: extModes(data, era, cur.explicit),
+    };
+}
+
+let lastContext = null;
+let lastContextJson = '';
+let muted = new Set();
+let guardKeys = [];
+
+/** Охрана промптов: на все ключи каталога (новые ключи расширки заводят по ходу — зовётся перед каждой генерацией). */
+function armGuard() {
+    try {
+        const store = ctx().extensionPrompts;
+        if (store && guardKeys.length) guardPrompts(store, guardKeys, key => muted.has(key));
+    } catch (e) { console.warn(TAG, 'охрана промптов не встала', e); }
+}
+
+function applyPolicyCss(data) {
+    if (typeof document === 'undefined') return;
+    const css = data ? policyCss(data) : '';
+    let el = document.getElementById('sacred-timeline-policy');
+    if (!css) { el?.remove(); return; }
+    if (!el) {
+        el = document.createElement('style');
+        el.id = 'sacred-timeline-policy';
+        document.head.appendChild(el);
+    }
+    if (el.textContent !== css) el.textContent = css;
+}
+
+function applyBodyAttrs(cx) {
+    if (typeof document === 'undefined' || !document.body) return;
+    const ds = document.body.dataset;
+    if (cx?.explicit) {
+        ds.stEra = cx.era.id;
+        if (cx.date) ds.stYear = cx.date.slice(0, 4); else delete ds.stYear;
+    } else {
+        delete ds.stEra;
+        delete ds.stYear;
+    }
+}
+
+/** Пересчитать снимок; если он поменялся — разослать «sacred-timeline:changed». */
+async function publish(data) {
+    if (data === undefined) data = await loadRegistry();
+    const cx = buildContext(data, current, ctx());
+    muted = cx ? mutedKeys(data, cx.ext) : new Set();
+    guardKeys = data ? catalogKeys(data) : [];
+    armGuard();
+    applyPolicyCss(data);
+    applyBodyAttrs(cx);
+    const json = JSON.stringify(cx);
+    if (json === lastContextJson) return cx;
+    lastContextJson = json;
+    lastContext = cx;
+    const copy = () => (cx ? JSON.parse(json) : null);
+    try { ctx().eventSource?.emit?.('sacred-timeline:changed', copy()); } catch (e) { console.warn(TAG, e); }
+    try {
+        if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+            window.dispatchEvent(new CustomEvent('sacred-timeline:changed', { detail: copy() }));
+        }
+    } catch (e) { console.warn(TAG, e); }
+    return cx;
+}
+
 // ───────────── Закулисье ─────────────
 
 /** Закомментировать в ростере Закулисья тех, кого нет на дату. Уже убранные раньше (skip) не трогаем. */
@@ -611,6 +796,9 @@ async function onChatChanged({ reset = true } = {}) {
     if (reset && ctx().getCurrentChatId?.() === chatId) {
         try { await syncPersonaAvatar(data, era, explicit); } catch (e) { console.warn(TAG, 'аватар персоны не переключён', e); }
     }
+    if (ctx().getCurrentChatId?.() === chatId) {
+        try { await publish(data); } catch (e) { console.warn(TAG, 'снимок для расширок не разослан', e); }
+    }
     renderStatus();
     if (!data || !era || !explicit || ctx().getCurrentChatId?.() !== chatId) return;
     const removed = await guardBackstage(data, era, date, md);
@@ -624,6 +812,7 @@ async function onChatChanged({ reset = true } = {}) {
 }
 
 async function onEntriesLoaded(payload) {
+    armGuard();   // последняя точка перед тем, как ST читает промпты расширок: ключи, заведённые на этом ходу
     try {
         if (!settings().filterLore) return;
         const { data, era, explicit, date } = await resolve();
@@ -649,11 +838,18 @@ async function onEntriesLoaded(payload) {
 
 /** Перед каждой генерацией (в группе — на ходу каждого участника): «кто есть кто» в промпт или пусто. */
 async function onGenerationStarted() {
+    let r = {};
+    try {
+        r = await resolve();
+        await publish(r.data);   // в группе на каждом ходу свой говорящий
+    } catch (e) {
+        console.warn(TAG, 'снимок для расширок не разослан', e);
+    }
     if (typeof ctx().setExtensionPrompt !== 'function') return;
     try {
         let block = '';
         if (settings().who) {
-            const { data, era, explicit, date, md } = await resolve();
+            const { data, era, explicit, date, md } = r;
             if (data && era && explicit) {
                 const c = ctx();
                 block = whoBlock(data, era, date, speakerOf(data, c.characters?.[c.characterId], c.name2), md?.backstage?.roster);
@@ -820,6 +1016,10 @@ if (typeof jQuery === 'function') {
         registerSlash();
         window.SacredTimeline = {
             version: VERSION,
+            /** Снимок для расширок (копия) или null, если чат вне мира. Меняется — событие «sacred-timeline:changed». */
+            context: () => (lastContext ? JSON.parse(lastContextJson) : null),
+            /** Режим расширки в этой эпохе: 'on' | 'off' | 'quiet' | 'hidden' | свой. Вне эпох — 'on'. */
+            mode: (id) => (lastContext?.ext?.[id]) || 'on',
             era: () => ({ ...current }),
             registry: loadRegistry,
             present: async (name, date) => {
