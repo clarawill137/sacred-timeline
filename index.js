@@ -1,14 +1,15 @@
-// Священный таймлайн — ядро, v0.4.
+// Священный таймлайн — ядро, v0.5.
 // Узнаёт эпоху и дату открытого чата по Реестру мира (лорбук на сервере, имя кончается на «Реестр») и:
 //  • пускает в промпт только лорбуки и записи своей эпохи (книги по эпохам, записи Хроники из будущего — вон);
 //  • тайны — только тем, кто их знает (gc.knows говорящего на дату), и не раньше, чем персона их прожила (gc.personal);
 //  • правит персону прямо в промпте под эпоху (возраст, «сейчас», внешность) — сама персона в ST не меняется;
 //  • убирает из Закулисья тех, кого в этой эпохе нет: умер, пыль, лёд, ещё не родился;
-//  • «кто есть кто» — короткая шпаргалка эпохи на дату сюжета в промпт (строки эпохи + кого здесь нет и почему).
+//  • «кто есть кто» — короткая шпаргалка эпохи на дату сюжета в промпт (строки эпохи + кого здесь нет и почему);
+//  • книги эпохи (era.lore) — сам подключает их в чатах отмеченной эпохи, без глобальных настроек ST.
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true };
 const WHO_KEY = 'sacred_timeline_who';
@@ -22,6 +23,7 @@ let current = { chatId: null, era: null, explicit: false, date: null, dateSource
 let lastLore = null;     // что срезали в последний раз
 let lastPersona = null;  // сколько правок персоны применили в последний раз
 let lastWho = null;      // сколько строк «кто есть кто» ушло в промпт в последний раз
+let lastBooks = null;    // книги эпохи: { added: [имена], missing: [имена], entries: n }
 
 function settings() {
     const ext = ctx().extensionSettings;
@@ -241,9 +243,53 @@ export function judgeEntry(entry, { eraId, date, eraFrom, speaker, personaId, pe
     return 'keep';
 }
 
+const LORE_KEYS = ['globalLore', 'characterLore', 'chatLore', 'personaLore'];
+
+/** Книги эпохи (era.lore), которых ещё нет среди загруженных ST, — без повторов и пустых имён. */
+export function eraBooksToAdd(payload, era) {
+    const names = Array.isArray(era?.lore) ? era.lore.filter(n => typeof n === 'string' && n.trim()) : [];
+    if (!names.length) return [];
+    const have = new Set();
+    for (const key of LORE_KEYS) {
+        for (const e of payload?.[key] || []) if (e?.world) have.add(e.world);
+    }
+    return [...new Set(names)].filter(n => !have.has(n));
+}
+
+/** Записи книги — в globalLore, в той же форме, что у ST: { uid, world, ...rest }. Возвращает число записей. */
+export function addBook(payload, name, data) {
+    const entries = data?.entries;
+    if (!entries || typeof entries !== 'object' || !Array.isArray(payload?.globalLore)) return 0;
+    let n = 0;
+    for (const key of Object.keys(entries)) {
+        const raw = entries[key];
+        if (!raw || typeof raw !== 'object') continue;
+        const { uid, ...rest } = raw;
+        payload.globalLore.push({ uid, world: name, ...rest });
+        n++;
+    }
+    return n;
+}
+
+/** Подключить книги эпохи. Книги, которых нет на сервере, — в missing (их видно в статусе). */
+async function joinEraBooks(payload, era) {
+    const out = { added: [], missing: [], entries: 0 };
+    const todo = eraBooksToAdd(payload, era);
+    if (!todo.length) return out;
+    const known = ctx().getWorldInfoNames?.();
+    for (const name of todo) {
+        if (Array.isArray(known) && !known.includes(name)) { out.missing.push(name); continue; }
+        let data = null;
+        try { data = await ctx().loadWorldInfo(name); } catch (e) { console.warn(TAG, `книга «${name}» не прочиталась`, e); }
+        const n = addBook(payload, name, data);
+        if (data?.entries) { out.added.push(name); out.entries += n; } else out.missing.push(name);
+    }
+    return out;
+}
+
 export function filterLore(payload, scope, books) {
     const stats = { dropped: 0, enabled: 0, byBook: {} };
-    for (const key of ['globalLore', 'characterLore', 'chatLore', 'personaLore']) {
+    for (const key of LORE_KEYS) {
         const arr = payload?.[key];
         if (!Array.isArray(arr)) continue;
         for (let i = arr.length - 1; i >= 0; i--) {
@@ -433,6 +479,7 @@ async function onChatChanged({ reset = true } = {}) {
         lastLore = null;
         lastPersona = null;
         lastWho = null;
+        lastBooks = null;
         ctx().setExtensionPrompt?.(WHO_KEY, '', IN_CHAT, WHO_DEPTH, false, ROLE_SYSTEM);
     }
     const { data, era, explicit, date, md } = await resolve();
@@ -451,8 +498,10 @@ async function onChatChanged({ reset = true } = {}) {
 async function onEntriesLoaded(payload) {
     try {
         if (!settings().filterLore) return;
-        const { data, era, date } = await resolve();
+        const { data, era, explicit, date } = await resolve();
         if (!data || !era) return;
+        // книги эпохи — только в чатах, отмеченных в Реестре; дальше они проходят тот же фильтр, что и все
+        lastBooks = explicit ? await joinEraBooks(payload, era) : null;
         const c = ctx();
         const scope = {
             eraId: era.id,
@@ -539,6 +588,12 @@ function statusLines() {
     out.push(current.date ? `Дата сюжета: ${esc(fmtDate(current.date))}${current.dateSource ? ` (${esc(current.dateSource)})` : ''}` : 'Дата сюжета: не видна — лорбуки по датам не режу.');
     const pruned = ctx().chatMetadata?.[MODULE]?.backstagePruned;
     if (Array.isArray(pruned) && pruned.length) out.push(`Закулисье: убраны ${esc(pruned.join(', '))}`);
+    if (lastBooks && (lastBooks.added.length || lastBooks.missing.length)) {
+        const parts = [];
+        if (lastBooks.added.length) parts.push(`подключено ${esc(lastBooks.added.join(', '))}`);
+        if (lastBooks.missing.length) parts.push(`нет на сервере: ${esc(lastBooks.missing.join(', '))}`);
+        out.push(`Книги эпохи: ${parts.join('; ')}`);
+    }
     if (lastLore) {
         const books = Object.entries(lastLore.byBook).map(([b, n]) => `${esc(b)}: ${n}`).join('; ');
         out.push(`Лорбуки: скрыто ${lastLore.dropped}${books ? ` (${books})` : ''}${lastLore.enabled ? `, включено срезов эпохи: ${lastLore.enabled}` : ''} · говорящий: ${lastLore.speaker ? esc(lastLore.speaker) : 'не опознан — тайны скрыты'}`);
