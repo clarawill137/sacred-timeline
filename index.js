@@ -15,7 +15,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.9.4';
+const VERSION = '0.9.5';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true, chronicle: true, strazh: true, chronist: true, reviser: '' };
 const WHO_KEY = 'sacred_timeline_who';
@@ -287,9 +287,11 @@ const isPublic = (g, at) => g?.public === true || (typeof g?.public === 'string'
  * говорящий не опознан — тайну не даём (кому она известна, записано явно, а его в списке нет).
  * Без карты знания: событие из личного времени персоны (gc.personal) позже её «сейчас» в этой эпохе — она его
  * ещё не прожила, вон. Карта знания важнее: если говорящий знает, а персона ещё нет — это петля, ему можно.
+ * Часть книги личности из другой эпохи (gc.part) на стыке эпох — строго: кончилась к началу этой эпохи (to ≤ from
+ * эпохи) или начинается с её конца (from ≥ to эпохи) — вон, хотя месяц стыка общий («по 2014-04» — включительно).
  * Возвращает 'keep' | 'drop' | 'enable'.
  */
-export function judgeEntry(entry, { eraId, date, eraFrom, speaker, personaId, personaNow }, books) {
+export function judgeEntry(entry, { eraId, date, eraFrom, eraTo, speaker, personaId, personaNow }, books) {
     const scope = books?.[entry?.world];
     if (scope && Array.isArray(scope.eras) && !scope.eras.includes(eraId)) return 'drop';
     const g = entry?.gc;
@@ -300,6 +302,10 @@ export function judgeEntry(entry, { eraId, date, eraFrom, speaker, personaId, pe
     }
     if (entry.disable) return 'keep';
     if (date && g.from && String(g.from) > date) return 'drop';
+    if (g.part && eraId && String(g.part) !== String(eraId)) {
+        if (g.to && eraFrom && String(g.to) <= String(eraFrom)) return 'drop';
+        if (g.from && eraTo && String(g.from) >= String(eraTo)) return 'drop';
+    }
     // книга личности (одна на человека): часть эпохи без даты чата меряем началом эпохи — чужие годы не смешиваются
     const at = date || (g.part ? eraFrom : null);
     if (!date && at && g.from && String(g.from) > at) return 'drop';
@@ -368,6 +374,7 @@ export function scopeFor(data, era, date, c) {
         eraId: era.id,
         date,
         eraFrom: era.from || null,
+        eraTo: era.to || null,
         speaker: speakerOf(data, c?.characters?.[c?.characterId], c?.name2),
         personaId: personaIdentity(data),
         personaNow: era.personaTime || date || era.from || null,
@@ -731,6 +738,49 @@ export function chronicleBlock(book, scope, books, { world, eraFrom, ahead = 4, 
     return out;
 }
 
+/**
+ * Обрывки памяти (карта знания, mode «fragments»): что у говорящего на эту дату всплывает без имён. Текст — gc.hint
+ * события (строка или { id говорящего | '*': строка }); без подсказки обрывок не показываем — в заголовках имена.
+ * Для персонажа это не знание, а подтекст: тело, запах, слово, дежавю; узнавания быть не может. Кто знает — не обрывки.
+ */
+export function fragmentsBlock(book, scope, { max = 5 } = {}) {
+    const at = scope?.date || scope?.eraFrom;
+    const sp = scope?.speaker || null;
+    const out = { text: '', count: 0 };
+    if (!book?.entries || !at || !sp) return out;
+    const seen = new Set();
+    const lines = Object.values(book.entries)
+        .filter(e => e?.gc && (!e.gc.status || e.gc.status === 'canon'))
+        .map(e => {
+            const g = e.gc;
+            const spans = g.knows?.[sp];
+            if (!Array.isArray(spans) || spans.some(s => s.mode === 'knows' && covers(s, at))) return null;
+            if (!spans.some(s => s.mode === 'fragments' && covers(s, at))) return null;
+            const h = typeof g.hint === 'string' ? g.hint : (g.hint?.[sp] || g.hint?.['*']);
+            return h && String(h).trim() ? { from: String(g.from || ''), text: String(h).trim() } : null;
+        })
+        .filter(x => x && !seen.has(x.text) && seen.add(x.text))
+        .sort((a, b) => a.from.localeCompare(b.from))
+        .slice(0, max);
+    if (!lines.length) return out;
+    out.count = lines.length;
+    out.text = '[Подтекст — обрывки памяти говорящего: всплывают без имён и без смысла — телом, запахом, словом, дежавю. '
+        + 'Он не знает, откуда они, и ни с кем их не связывает. Не объясняй и не превращай в узнавание]\n'
+        + lines.map(l => `— ${l.text}`).join('\n');
+    return out;
+}
+
+/** Кто из сцены на эту дату носит обрывки (для Стража): id → есть хоть один отрезок «fragments». */
+export function fragmentHolders(book, at, ids = []) {
+    if (!book?.entries || !at) return [];
+    const has = id => Object.values(book.entries).some(e => {
+        const spans = e?.gc?.knows?.[id];
+        return Array.isArray(spans) && spans.some(s => s.mode === 'fragments' && covers(s, at))
+            && !spans.some(s => s.mode === 'knows' && covers(s, at));
+    });
+    return [...new Set(ids.filter(Boolean))].filter(has);
+}
+
 // ───────────── кто есть кто ─────────────
 
 /** Строки эпохи на дату: у строки бывают from/to (как у записей Хроники) и speaker — только на его ходу. */
@@ -965,6 +1015,8 @@ export function canonBrief({ data, era, date, book, cast = [] }) {
     const gone = ids.filter(g => (g.slices || []).length && !presentAt(g, at)).map(g => `${g.name} — ${goneReason(g, at)}`);
     if (gone.length) lines.push(`Канон — в этом времени нет (не могут быть в сцене): ${gone.slice(0, 10).join('; ')}.`);
     const who = [...new Set(cast.filter(Boolean))];
+    const frag = fragmentHolders(book, at, who);
+    if (frag.length) lines.push(`Канон — обрывки памяти (только подтекст, без имён; узнавания быть не может): ${frag.map(nameOf).join(', ')}.`);
     if (who.length > 1) {
         const knowsAt = (g, id) => (g.knows && typeof g.knows === 'object'
             ? (g.knows[id] || []).some(s => s.mode === 'knows' && covers(s, at))
@@ -1756,9 +1808,11 @@ async function onGenerationStarted() {
         if (settings().chronicle && data && era && explicit && w?.chronicle) {
             const book = await ctx().loadWorldInfo?.(w.chronicle);
             if (book?.entries && !legacyChronicleActive(book, era.id)) {
-                const res = chronicleBlock(book, scopeFor(data, era, date, ctx()), w.books || {}, { world: w.chronicle, eraFrom: era.from });
-                text = res.text;
-                lastChron = { past: res.past, ahead: res.ahead, held: res.held };
+                const scope = scopeFor(data, era, date, ctx());
+                const res = chronicleBlock(book, scope, w.books || {}, { world: w.chronicle, eraFrom: era.from });
+                const frag = fragmentsBlock(book, scope);
+                text = [res.text, frag.text].filter(Boolean).join('\n\n');
+                lastChron = { past: res.past, ahead: res.ahead, held: res.held, fragments: frag.count };
             }
         }
         ctx().setExtensionPrompt(CHRON_KEY, text, IN_PROMPT, 0, false, ROLE_SYSTEM);
@@ -1849,7 +1903,7 @@ function statusLines() {
     }
     if (lastHistory?.added?.length) out.push(`Память прошлых эпох: ${esc(lastHistory.added.join(', '))} — записей ${lastHistory.entries} (дальше — по дате и кто знает)`);
     if (!settings().chronicle) out.push('Хроника под дату: выключено');
-    else if (lastChron) out.push(`Хроника под дату: прошлое — ${lastChron.past} ${plural(lastChron.past, 'строка', 'строки', 'строк')}, впереди фиксированных точек — ${lastChron.ahead} (режиссёру)${lastChron.held ? `; событий этой эпохи ждут игры — ${lastChron.held}` : ''}`);
+    else if (lastChron) out.push(`Хроника под дату: прошлое — ${lastChron.past} ${plural(lastChron.past, 'строка', 'строки', 'строк')}, впереди фиксированных точек — ${lastChron.ahead} (режиссёру)${lastChron.held ? `; событий этой эпохи ждут игры — ${lastChron.held}` : ''}${lastChron.fragments ? `; обрывков памяти у говорящего — ${lastChron.fragments}` : ''}`);
     if (!settings().who) out.push('Кто есть кто: выключено');
     else if (lastWho !== null) out.push(lastWho ? `Кто есть кто: ${lastWho} ${plural(lastWho, 'строка', 'строки', 'строк')} в промпте` : 'Кто есть кто: для этой эпохи нет');
     return out;
