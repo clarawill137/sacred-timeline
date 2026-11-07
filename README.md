@@ -116,7 +116,7 @@
 const cx = window.SacredTimeline?.context();   // null — чат вне мира или ядра нет
 // {
 //   v: 1,
-//   world:   { id, name, chronicle },
+//   world:   { id, name, chronicle, defaultEra },
 //   era:     { id, label, from, to, status, memoryBook, lore: [книги эпохи] },
 //   explicit: true,          // эпоха отмечена в Реестре (false — взята по умолчанию)
 //   chatId, date: 'YYYY-MM-DD' | 'YYYY-MM' | null, dateSource,

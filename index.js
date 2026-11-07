@@ -15,7 +15,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.9.3';
+const VERSION = '0.9.4';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true, chronicle: true, strazh: true, chronist: true, reviser: '' };
 const WHO_KEY = 'sacred_timeline_who';
@@ -1519,7 +1519,7 @@ export function buildContext(data, cur, c) {
     if (pr && c?.name1) people[c.name1] = { identity: pr.identity.id, slice: pr.slice.id, label: pr.slice.label || null };
     return {
         v: 1,
-        world: w ? { id: w.id || null, name: w.name || null, chronicle: w.chronicle || null } : null,
+        world: w ? { id: w.id || null, name: w.name || null, chronicle: w.chronicle || null, defaultEra: w.defaultEra ? String(w.defaultEra) : null } : null,
         era: { id: String(era.id), label: era.label || '', from: era.from || null, to: era.to || null,
             status: era.status || null, memoryBook: era.memoryBook || null, history: historyBooks(data, era),
             lore: [...(era.lore || [])] },
