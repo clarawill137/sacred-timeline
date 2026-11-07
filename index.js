@@ -1,4 +1,4 @@
-// Священный таймлайн — ядро, v0.7.
+// Священный таймлайн — ядро, v0.8.
 // Узнаёт эпоху и дату открытого чата по Реестру мира (лорбук на сервере, имя кончается на «Реестр») и:
 //  • пускает в промпт только лорбуки и записи своей эпохи (книги по эпохам, записи Хроники из будущего — вон);
 //  • тайны — только тем, кто их знает (gc.knows говорящего на дату), и не раньше, чем персона их прожила (gc.personal);
@@ -13,7 +13,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.7.2';
+const VERSION = '0.8.0';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true };
 const WHO_KEY = 'sacred_timeline_who';
@@ -23,7 +23,7 @@ const ROLE_SYSTEM = 0;   // extension_prompt_roles.SYSTEM
 
 const ctx = () => SillyTavern.getContext();
 
-let current = { chatId: null, era: null, explicit: false, date: null, dateSource: '', registry: null };
+let current = { chatId: null, era: null, explicit: false, date: null, dateSource: '', world: null, registry: null };
 let lastLore = null;     // что срезали в последний раз
 let lastPersona = null;  // сколько правок персоны применили в последний раз
 let lastWho = null;      // сколько строк «кто есть кто» ушло в промпт в последний раз
@@ -96,6 +96,55 @@ export function eraById(data, id) {
 /** Дата, на которую смотрим состав эпохи: её начало. */
 export function eraDate(era) {
     return era?.from || era?.to || null;
+}
+
+// ───────────── миры ─────────────
+
+/** Карточки чата: персонаж 1:1 или участники группы. */
+function chatCards(c) {
+    if (c?.groupId !== undefined && c?.groupId !== null && c?.groupId !== '') {
+        const g = (c.groups || []).find(x => String(x.id) === String(c.groupId));
+        return (g?.members || []).map(av => (c.characters || []).find(x => x.avatar === av) || { avatar: av });
+    }
+    const ch = c?.characters?.[c?.characterId];
+    return ch ? [ch] : [];
+}
+
+/**
+ * Чат из этого мира? Кто-то из его персонажей — личность мира (по карточке обличья или по имени).
+ * Отмеченные в Реестре чаты (эпохи) — в мире всегда; это для остальных.
+ */
+export function inWorld(data, cards) {
+    const ids = records(data, 'identity');
+    for (const ch of cards || []) {
+        if (!ch) continue;
+        if (ch.avatar && ids.some(g => (g.slices || []).some(s => s.card === ch.avatar))) return true;
+        if (ch.name && findIdentity(data, ch.name)) return true;
+    }
+    return false;
+}
+
+/** Книги мира: всё, что Реестр знает как свои (книги с эпохами, ownBooks, Хроника, сам Реестр). */
+export function worldBooks(data) {
+    const w = worldRecord(data);
+    if (!w) return new Set();
+    return new Set([...Object.keys(w.books || {}), ...(w.ownBooks || []), w.chronicle, w.registry].filter(Boolean));
+}
+
+/** Чат чужого мира: записи книг этого мира — вон (глобальные лорбуки мира в чужие ролки не текут). */
+export function hideWorldBooks(payload, books) {
+    const stats = { dropped: 0, enabled: 0, byBook: {}, outside: true };
+    for (const key of LORE_KEYS) {
+        const arr = payload?.[key];
+        if (!Array.isArray(arr)) continue;
+        for (let i = arr.length - 1; i >= 0; i--) {
+            const w = arr[i]?.world;
+            if (!w || !books.has(w)) continue;
+            if (!arr[i].disable) { stats.dropped++; stats.byBook[w] = (stats.byBook[w] || 0) + 1; }
+            arr.splice(i, 1);
+        }
+    }
+    return stats;
 }
 
 // ───────────── дата чата ─────────────
@@ -585,10 +634,12 @@ async function resolve() {
     const md = c.chatMetadata;
     let era = null;
     let explicit = false;
+    let world = null;   // id мира чата; null — чат чужого мира (или Реестра нет)
     if (data && chatId) {
         era = findEra(data, { marker: md?.[MODULE]?.era, chatId, groupId: c.groupId });
         explicit = !!era;
-        if (!era) era = eraById(data, worldRecord(data)?.defaultEra);
+        if (era || inWorld(data, chatCards(c))) world = worldRecord(data)?.id || 'world';
+        if (!era && world) era = eraById(data, worldRecord(data)?.defaultEra);
     }
     let date = null;
     let dateSource = '';
@@ -598,8 +649,8 @@ async function resolve() {
         dateSource = sd.source;
         if (!date && era.to) { date = era.from; dateSource = 'начало эпохи'; }
     }
-    current = { chatId, era, explicit, date, dateSource, registry: current.registry };
-    return { data, era, explicit, date, md };
+    current = { chatId, era, explicit, date, dateSource, world, registry: current.registry };
+    return { data, era, explicit, date, md, world };
 }
 
 // ───────────── память эпохи ─────────────
@@ -741,9 +792,14 @@ const MUTE_MODES = ['off', 'quiet'];
 const HIDE_MODES = ['off', 'hidden'];
 
 /** Режимы расширок в эпохе: из каталога (default, иначе 'on'), поверх — era.ext. Только в отмеченных эпохах. */
-export function extModes(data, era, explicit) {
+export function extModes(data, era, explicit, outside = false) {
     const out = {};
     for (const x of records(data, 'ext')) if (x.id) out[x.id] = String(x.default || 'on');
+    if (outside) {
+        // чат чужого мира: расширки этого мира (world.outside) — выкл
+        for (const [id, mode] of Object.entries(worldRecord(data)?.outside || {})) out[id] = String(mode);
+        return out;
+    }
     if (explicit && era?.ext && typeof era.ext === 'object') {
         for (const [id, mode] of Object.entries(era.ext)) out[id] = String(mode);
     }
@@ -796,13 +852,21 @@ const GATE = Symbol.for('sacredTimeline.gate');
  * не трогаем.
  */
 export function gateSetting(obj, key, isClosed) {
+    return guardSetting(obj, key, v => (isClosed() ? false : v));
+}
+
+/**
+ * Поле настроек расширки под присмотром ядра: расширка читает show(значение), пишет — через unshow (снимаем свои
+ * пометки), а в сохранение настроек уходит настоящее значение (toJSON). Поле, которого ещё нет, не трогаем.
+ */
+export function guardSetting(obj, key, show, unshow = v => v) {
     if (!obj || typeof obj !== 'object' || !key) return false;
     const d = Object.getOwnPropertyDescriptor(obj, key);
     if (!d || d.get || d.set || !d.configurable) return false;
     let value = d.value;
-    const get = () => (isClosed() ? false : value);
+    const get = () => show(value);
     get[GATE] = () => value;
-    Object.defineProperty(obj, key, { configurable: true, enumerable: true, get, set: v => { value = v; } });
+    Object.defineProperty(obj, key, { configurable: true, enumerable: true, get, set: v => { value = unshow(v); } });
     if (!Object.prototype.hasOwnProperty.call(obj, 'toJSON')) {
         Object.defineProperty(obj, 'toJSON', {
             configurable: true, enumerable: false, writable: true,
@@ -817,6 +881,39 @@ export function gateSetting(obj, key, isClosed) {
         });
     }
     return true;
+}
+
+const ABSENT_MARK = '← нет в эпохе (ядро)';
+
+/**
+ * Список персонажей строками («Имя = …» или «Имя | …»): тех, кого на дату нет в мире (умер, пыль, лёд, не родился),
+ * расширка видит закомментированными. Это только взгляд — сам список в настройках не меняется.
+ */
+export function rosterView(text, data, date) {
+    if (typeof text !== 'string' || !data || !date) return text;
+    return text.split('\n').map(line => {
+        const t = line.trim();
+        if (!t || t.startsWith('#')) return line;
+        const name = t.split(/[=|]/)[0].trim();
+        const id = name ? findIdentity(data, name) : null;
+        return id && !presentAt(id, date) ? `# ${t}   ${ABSENT_MARK}` : line;
+    }).join('\n');
+}
+
+/** Снять пометки ядра (если расширка сохранила то, что видела). */
+export function rosterUnview(text) {
+    if (typeof text !== 'string' || !text.includes(ABSENT_MARK)) return text;
+    return text.split('\n').map(line => {
+        const i = line.indexOf(ABSENT_MARK);
+        return i < 0 ? line : line.slice(0, i).replace(/^\s*#\s?/, '').replace(/\s+$/, '');
+    }).join('\n');
+}
+
+/** Списки персонажей в настройках расширок (views в каталоге): [{ id, settings, key }]. */
+export function catalogViews(data) {
+    return records(data, 'ext').flatMap(x => (x.views || [])
+        .filter(v => v && v.settings && v.key && (v.kind || 'roster') === 'roster')
+        .map(v => ({ id: x.id, settings: String(v.settings), key: String(v.key) })));
 }
 
 /** Заслонки из каталога: [{ id, settings, key }] — у расширок с главным выключателем (gate). */
@@ -840,12 +937,21 @@ export function policyCss(data) {
             }
         }
     }
+    for (const [id, mode] of Object.entries(worldRecord(data)?.outside || {})) {
+        if (!HIDE_MODES.includes(String(mode))) continue;
+        for (const sel of exts[id]?.ui || []) if (sel && !/[{}]/.test(sel)) sels.push(`body[data-st-world="none"] ${sel}`);
+    }
     return sels.length ? `${sels.join(',\n')} { display: none !important; }` : '';
 }
 
 /** Снимок для расширок: мир, эпоха, дата, кто говорит, состав, персона, режимы расширок. null — чат вне мира. */
 export function buildContext(data, cur, c) {
     const era = cur?.era;
+    if (data && cur?.chatId && !era && !cur.world) {
+        // чат чужого мира: мира и эпохи нет, расширки этого мира — по world.outside
+        return { v: 1, world: null, era: null, explicit: false, chatId: cur.chatId, date: null, dateSource: '',
+            speaker: null, cast: [], persona: null, ext: extModes(data, null, false, true) };
+    }
     if (!data || !era) return null;
     const w = worldRecord(data);
     const short = id => {
@@ -880,6 +986,8 @@ let muted = new Set();
 let guardKeys = [];
 let closed = new Set();   // расширки, выключенные в эпохе (режим off) — для заслонок
 let gates = [];
+let views = [];          // списки персонажей в настройках расширок
+let viewState = { data: null, date: null };
 
 /** Охрана промптов и заслонки: на всё из каталога (расширки заводят ключи по ходу — зовётся перед каждой генерацией). */
 function armGuard() {
@@ -888,6 +996,9 @@ function armGuard() {
         const store = c.extensionPrompts;
         if (store && guardKeys.length) guardPrompts(store, guardKeys, key => muted.has(key));
         for (const g of gates) gateSetting(c.extensionSettings?.[g.settings], g.key, () => closed.has(g.id));
+        for (const v of views) {
+            guardSetting(c.extensionSettings?.[v.settings], v.key, t => rosterView(t, viewState.data, viewState.date), rosterUnview);
+        }
     } catch (e) { console.warn(TAG, 'охрана расширок не встала', e); }
 }
 
@@ -907,6 +1018,7 @@ function applyPolicyCss(data) {
 function applyBodyAttrs(cx) {
     if (typeof document === 'undefined' || !document.body) return;
     const ds = document.body.dataset;
+    if (cx) ds.stWorld = cx.world?.id || 'none'; else delete ds.stWorld;
     if (cx?.explicit) {
         ds.stEra = cx.era.id;
         if (cx.date) ds.stYear = cx.date.slice(0, 4); else delete ds.stYear;
@@ -924,6 +1036,8 @@ async function publish(data) {
     closed = new Set(cx ? Object.entries(cx.ext).filter(([, mode]) => mode === 'off').map(([id]) => id) : []);
     guardKeys = data ? catalogKeys(data) : [];
     gates = data ? catalogGates(data) : [];
+    views = data ? catalogViews(data) : [];
+    viewState = { data, date: cx?.era ? (current.date || cx.era.from || null) : null };
     armGuard();
     applyPolicyCss(data);
     applyBodyAttrs(cx);
@@ -993,7 +1107,9 @@ async function onChatChanged({ reset = true } = {}) {
     }
     const { data, era, explicit, date, md } = await resolve();
     if (reset && ctx().getCurrentChatId?.() === chatId) {
-        try { await syncPersonaAvatar(data, era, explicit); } catch (e) { console.warn(TAG, 'аватар персоны не переключён', e); }
+        // в чужом мире эпохи нет — персону всё равно возвращаем с двойника на базовую (как в неотмеченном чате)
+        const personaEra = era || (data ? eraById(data, worldRecord(data)?.defaultEra) : null);
+        try { await syncPersonaAvatar(data, personaEra, explicit); } catch (e) { console.warn(TAG, 'аватар персоны не переключён', e); }
     }
     if (reset && ctx().getCurrentChatId?.() === chatId) {
         try { await bindEraMemory(era, explicit, chatId); } catch (e) { console.warn(TAG, 'память эпохи не привязана', e); }
@@ -1018,7 +1134,13 @@ async function onEntriesLoaded(payload) {
     armGuard();   // последняя точка перед тем, как ST читает промпты расширок: ключи, заведённые на этом ходу
     try {
         if (!settings().filterLore) return;
-        const { data, era, explicit, date } = await resolve();
+        const { data, era, explicit, date, world } = await resolve();
+        if (data && !world && current.chatId) {
+            lastLore = hideWorldBooks(payload, worldBooks(data));   // чужой мир: книги этого мира — вон
+            lastLore.speaker = null;
+            renderStatus();
+            return;
+        }
         if (!data || !era) return;
         // книги эпохи — только в чатах, отмеченных в Реестре; дальше они проходят тот же фильтр, что и все
         lastBooks = explicit ? await joinEraBooks(payload, era) : null;
@@ -1100,7 +1222,14 @@ function statusLines() {
         return out;
     }
     if (!current.era) {
-        out.push('Эпоха: в Реестре не отмечена.');
+        if (!current.world && lastLore?.outside) {
+            const books = Object.entries(lastLore.byBook).map(([b, n]) => `${esc(b)}: ${n}`).join('; ');
+            out.push(`Мир: чужой — книги этого мира скрыты${lastLore.dropped ? ` (${lastLore.dropped}${books ? `: ${books}` : ''})` : ''}`);
+            const off = Object.entries(lastContext?.ext || {}).filter(([, m]) => m === 'off').map(([id]) => id);
+            if (off.length) out.push(`Расширки этого мира выключены: ${esc(off.join(', '))}`);
+        } else {
+            out.push('Эпоха: в Реестре не отмечена.');
+        }
         return out;
     }
     const how = current.explicit ? '' : ' (по умолчанию — чат в Реестре не отмечен)';
