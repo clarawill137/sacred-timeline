@@ -9,7 +9,10 @@
 #
 # Синкаются только: worlds/*.json, OpenAI Settings/*.json, groups/*.json, characters/*.png.
 # Из settings.json уезжает только выжимка (_export/settings-safe.json): персоны, привязки
-# лорбуков, теги. Чаты, бэкапы, ключи API (secrets.json, токены расширений) никогда не уезжают.
+# лорбуков, теги. Ключи API (secrets.json, токены расширений) и бэкапы никогда не уезжают.
+# Чаты: всегда уезжает только их список (_export/chats-index.json). Сами чаты — лишь те, что
+# Claude попросил в _request/chats.txt (в _chats/). Чаты от Claude (_out/) ставятся только
+# НОВЫМИ файлами — существующий чат мост не перезапишет никогда.
 
 set -Eeuo pipefail
 trap 'printf "❌ Сбой в строке %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
@@ -24,6 +27,9 @@ REMOTE="${ST_SYNC_REMOTE:-git@${HOST_ALIAS}:${REPO}.git}"
 BRANCH="main"
 SPECS=("worlds|*.json" "OpenAI Settings|*.json" "groups|*.json" "characters|*.png")
 EXPORT_DIR="_export"   # только для чтения Claude; на сервер никогда не применяется
+CHATS_DIR="_chats"     # снимки запрошенных чатов — только для чтения Claude
+REQUEST_FILE="_request/chats.txt"
+OUT_DIR="_out"         # новые чаты от Claude: только новыми файлами
 SELF_URL="https://raw.githubusercontent.com/clarawill137/sacred-timeline/main/tools/st-sync.sh"
 MAX_BYTES=$((90 * 1024 * 1024))   # GitHub не берёт файлы больше 100 МБ
 FAKE="${ST_SYNC_FAKE_ROOT:-}"     # только для тестов: папка вместо контейнера
@@ -88,6 +94,21 @@ ct_put() { # $1 файл на хосте, $2 путь от DATA
 ct_rm() {
   if [[ -n $FAKE ]]; then rm -f -- "$FAKE$DATA/$1"
   else docker exec -u 0 "$CT" rm -f "$DATA/$1"; fi
+}
+
+# строки «размер|mtime|путь» для chats/*/*.jsonl и group chats/*.jsonl
+ct_chat_index() {
+  if [[ -n $FAKE ]]; then
+    (cd "$FAKE$DATA" 2>/dev/null || exit 0
+     for f in chats/*/*.jsonl "group chats"/*.jsonl; do [ -f "$f" ] && stat -c '%s|%Y|%n' "$f"; done; exit 0)
+  else
+    docker exec "$CT" sh -c 'cd "$1" 2>/dev/null || exit 0; for f in chats/*/*.jsonl "group chats"/*.jsonl; do [ -f "$f" ] && stat -c "%s|%Y|%n" "$f"; done; exit 0' sh "$DATA"
+  fi
+}
+
+ct_mkdir() {
+  if [[ -n $FAKE ]]; then mkdir -p "$FAKE$DATA/$1"
+  else docker exec -u 0 "$CT" mkdir -p "$DATA/$1"; fi
 }
 
 ct_owner() {
@@ -166,10 +187,12 @@ snapshot() { # $1 — текст коммита
     cp -a "$TMPD/new/$dir/." "$MIRROR/$dir/"
   done
   export_settings
+  export_chats
   rm -rf "$TMPD"; TMPD=""
 
   g add -A -- "${DIRS[@]}"
   if [[ -e "$MIRROR/$EXPORT_DIR" ]]; then g add -A -- "$EXPORT_DIR"; fi
+  g add -A -- "$CHATS_DIR" 2>/dev/null || true
   if ! g diff --cached --quiet; then
     g commit -q -m "$msg"
     return 0
@@ -207,6 +230,71 @@ PYEOF
   else
     warn "Персоны не выгрузились."
   fi
+  return 0
+}
+
+# список чатов + запрошенные Claude чаты (_request/chats.txt) → _chats/
+export_chats() {
+  command -v python3 >/dev/null || return 0
+  local idx="$TMPD/chatidx"
+  if ! ct_chat_index > "$idx" 2>/dev/null; then warn "Не вышло прочитать список чатов."; return 0; fi
+  mkdir -p "$TMPD/export"
+  if python3 - "$idx" "$TMPD/export/chats-index.json" <<'PYEOF'
+import json, sys
+rows = []
+for line in open(sys.argv[1], encoding='utf-8', errors='replace'):
+    parts = line.rstrip('\n').split('|', 2)
+    if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+        rows.append({'path': parts[2], 'size': int(parts[0]), 'mtime': int(parts[1])})
+rows.sort(key=lambda r: r['path'])
+open(sys.argv[2], 'w', encoding='utf-8').write(json.dumps(rows, ensure_ascii=False, indent=2) + '\n')
+PYEOF
+  then
+    mkdir -p "$MIRROR/$EXPORT_DIR"
+    cp -- "$TMPD/export/chats-index.json" "$MIRROR/$EXPORT_DIR/"
+  else
+    warn "Список чатов не собрался."
+  fi
+
+  # запросы берём из свежей origin/main: так просьба Claude срабатывает в тот же запуск
+  { g show "origin/$BRANCH:$REQUEST_FILE" 2>/dev/null || g show "HEAD:$REQUEST_FILE" 2>/dev/null || true; } > "$TMPD/req"
+  python3 - "$idx" "$TMPD/req" "$TMPD/want" "$MAX_BYTES" <<'PYEOF' || { warn "Запросы чатов не разобрались."; return 0; }
+import sys
+idx = []
+for line in open(sys.argv[1], encoding='utf-8', errors='replace'):
+    parts = line.rstrip('\n').split('|', 2)
+    if len(parts) == 3 and parts[0].isdigit():
+        idx.append((int(parts[0]), parts[2]))
+reqs = [l.strip() for l in open(sys.argv[2], encoding='utf-8', errors='replace')]
+mx = int(sys.argv[4])
+out = []
+for r in reqs:
+    if not r or r.startswith('#'):
+        continue
+    if '..' in r or not (r.startswith('chats/') or r.startswith('group chats/')):
+        print('⚠️  Пропускаю запрос не из чатов: ' + r, file=sys.stderr)
+        continue
+    hit = False
+    for size, path in idx:
+        if path == r or (r.endswith('/') and path.startswith(r)):
+            hit = True
+            if size > mx:
+                print('⚠️  Чат больше 90 МБ, пропускаю: ' + path, file=sys.stderr)
+            elif path not in out:
+                out.append(path)
+    if not hit:
+        print('⚠️  Не нашла на сервере чат из запроса: ' + r, file=sys.stderr)
+open(sys.argv[3], 'w', encoding='utf-8').write(''.join(p + '\0' for p in out))
+PYEOF
+  local -a want=()
+  mapfile -d '' -t want < "$TMPD/want"
+  rm -rf -- "${MIRROR:?}/$CHATS_DIR"
+  (( ${#want[@]} )) || return 0
+  mkdir -p "$TMPD/chats"
+  if ! ct_fetch "$TMPD/chats" "${want[@]}"; then warn "Запрошенные чаты не забрались."; return 0; fi
+  mkdir -p "$MIRROR/$CHATS_DIR"
+  cp -a "$TMPD/chats/." "$MIRROR/$CHATS_DIR/"
+  say "💬 Чатов для Claude в снимке: ${#want[@]}"
   return 0
 }
 
@@ -256,6 +344,59 @@ validate_changes() {
     esac
   done
   return $bad
+}
+
+# CO_PATH: новые чаты от Claude в _out/ между $1 и $2
+collect_out() {
+  CO_PATH=()
+  local tmp; tmp=$(mktemp)
+  g diff --no-renames --name-only -z --diff-filter=AM "$1" "$2" -- "$OUT_DIR" > "$tmp" 2>/dev/null || true
+  mapfile -d '' -t CO_PATH < "$tmp"
+  rm -f "$tmp"
+}
+
+show_out() {
+  local p
+  for p in "${CO_PATH[@]}"; do say "   + новый чат ${p#"$OUT_DIR"/}"; done
+}
+
+validate_out() {
+  local p rel name dir listing bad=0
+  for p in "${CO_PATH[@]}"; do
+    rel=${p#"$OUT_DIR"/}
+    if [[ ! $rel =~ ^chats/[^/]+/[^/]+\.jsonl$ && ! $rel =~ ^group\ chats/[^/]+\.jsonl$ ]]; then
+      warn "Чат не туда: $rel"; bad=1; continue
+    fi
+    dir=$(dirname -- "$rel"); name=$(basename -- "$rel")
+    listing=$(ct_list "$dir" | tr '\0' '\n')
+    if grep -Fxq -- "$name" <<<"$listing"; then
+      warn "Такой чат уже есть — не перезаписываю: $rel"; bad=1; continue
+    fi
+    if command -v python3 >/dev/null; then
+      python3 - "$MIRROR/$p" <<'PYEOF' || { warn "Битый чат (JSONL): $rel"; bad=1; }
+import json, sys
+try:
+    lines = [l for l in open(sys.argv[1], encoding='utf-8') if l.strip()]
+    assert lines and isinstance(json.loads(lines[0]), dict)
+    for l in lines:
+        json.loads(l)
+except Exception:
+    sys.exit(1)
+PYEOF
+    fi
+  done
+  return $bad
+}
+
+apply_out() {
+  local p rel owner
+  owner=$(ct_owner)
+  for p in "${CO_PATH[@]}"; do
+    rel=${p#"$OUT_DIR"/}
+    ct_mkdir "$(dirname -- "$rel")"
+    ct_put "$MIRROR/$p" "$rel"
+    ct_chown "$owner" "$rel"
+  done
 }
 
 confirm() {
@@ -358,7 +499,8 @@ cmd_sync() {
 
   local merge; merge=$(g rev-parse HEAD)
   collect_changes "$snap" "$merge"
-  if (( ${#CH_PATH[@]} == 0 )); then
+  collect_out "$snap" "$merge"
+  if (( ${#CH_PATH[@]} == 0 && ${#CO_PATH[@]} == 0 )); then
     push_main
     say "✅ Снимок отправлен. В правках Claude нет файлов для сервера."
     return 0
@@ -366,9 +508,10 @@ cmd_sync() {
 
   say "📦 Правки от Claude:"
   show_changes
-  if ! validate_changes; then
+  show_out
+  if ! validate_changes || ! validate_out; then
     g reset -q --hard "$snap"; push_server_branch
-    die "Есть битые файлы — ничего не применено. Напиши Claude."
+    die "Что-то из правок применить нельзя (см. выше) — ничего не применено. Напиши Claude."
   fi
   if ! confirm "Применить на сервер?"; then
     g reset -q --hard "$snap"; push_server_branch
@@ -377,9 +520,13 @@ cmd_sync() {
   fi
 
   printf '%s\n' "$merge" > "$MIRROR/.git/st-sync-last"
-  apply_changes
+  if (( ${#CH_PATH[@]} )); then apply_changes; fi
+  if (( ${#CO_PATH[@]} )); then apply_out; fi
   push_main
   after_apply_hint
+  if (( ${#CO_PATH[@]} )); then
+    say "   Новый чат — в списке чатов персонажа; старый остался как был. Не понравится — удали новый в ST."
+  fi
 }
 
 cmd_undo() {
