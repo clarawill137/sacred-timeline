@@ -6,6 +6,7 @@
 #   st-sync undo    — откатить последнее применение (свежие записи STMB не трогает)
 #   st-sync status  — что сейчас происходит
 #   st-sync update  — обновить сам st-sync с GitHub
+#   st-sync ext     — только расширки: подтянуть свои с GitHub по списку (то же делает и обычный st-sync)
 #
 # Синкаются только: worlds/*.json, OpenAI Settings/*.json, groups/*.json, characters/*.png,
 # User Avatars/*.png (аватарки персон: картинки, без настроек персон).
@@ -14,6 +15,10 @@
 # Чаты: всегда уезжает только их список (_export/chats-index.json). Сами чаты — лишь те, что
 # Claude попросил в _request/chats.txt (в _chats/). Чаты от Claude (_out/) ставятся только
 # НОВЫМИ файлами — существующий чат мост не перезапишет никогда.
+# Расширки: список своих расширок — extensions.txt в репе (пишет Claude): строка — ссылка на репу GitHub
+# (подтянуть, если стоит), «+ ссылка» (ещё и поставить, если нет), «- папка» (убрать в бэкап). Только свои репы
+# (github.com/clarawill137), только fast-forward; папку с твоими правками не трогает. Чужие пропатченные
+# расширки мост не обновляет никогда.
 
 set -Eeuo pipefail
 trap 'printf "❌ Сбой в строке %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
@@ -31,6 +36,10 @@ EXPORT_DIR="_export"   # только для чтения Claude; на серв�
 CHATS_DIR="_chats"     # снимки запрошенных чатов — только для чтения Claude
 REQUEST_FILE="_request/chats.txt"
 OUT_DIR="_out"         # новые чаты от Claude: только новыми файлами
+EXT_LIST="extensions.txt"                 # свои расширки: что держать на сервере (пишет Claude)
+EXT_INDEX="extensions-index.json"         # что стоит на сервере — в _export, только для чтения
+EXT_ALLOW="${ST_SYNC_EXT_ALLOW:-^https://github\.com/clarawill137/[A-Za-z0-9._-]+$}"
+EXT_TRASH="backups/extensions-removed"    # куда уезжают убранные расширки (от DATA)
 SELF_URL="https://raw.githubusercontent.com/clarawill137/sacred-timeline/main/tools/st-sync.sh"
 MAX_BYTES=$((90 * 1024 * 1024))   # GitHub не берёт файлы больше 100 МБ
 FAKE="${ST_SYNC_FAKE_ROOT:-}"     # только для тестов: папка вместо контейнера
@@ -181,6 +190,153 @@ lock() {
 push_main() { g push -q origin "HEAD:refs/heads/$BRANCH"; }
 push_server_branch() { g push -q -f origin "HEAD:refs/heads/server" 2>/dev/null || warn "Не вышло отправить ветку server."; }
 
+# ---------- расширки ----------
+
+# sh в контейнере от root, рабочая папка — DATA ($1 — скрипт, дальше аргументы); в тестах — в FAKE-папке
+ct_sh() {
+  local script=$1; shift
+  if [[ -n $FAKE ]]; then (cd "$FAKE$DATA" && sh -c "$script" sh "$@")
+  else docker exec -u 0 -w "$DATA" "$CT" sh -c "$script" sh "$@"; fi
+}
+
+# общее для скриптов в контейнере: git без «dubious ownership», ссылки без хвостов и паролей, все клоны расширок
+EXT_SH_LIB='
+G() { git -c safe.directory="*" "$@"; }
+norm() { printf "%s" "$1" | sed -e "s#://[^/@]*@#://#" -e "s#\.git\$##" -e "s#/*\$##" | tr "A-Z" "a-z"; }
+roots() { echo extensions; [ -d ../../../public/scripts/extensions/third-party ] && echo ../../../public/scripts/extensions/third-party; }
+'
+
+# что стоит на сервере: папка, ссылка репы, коммит, свои правки, версия — строками через таб
+ct_ext_index() {
+  ct_sh "$EXT_SH_LIB"'
+command -v git >/dev/null 2>&1 || HAVE_GIT=0
+for r in $(roots); do
+  for d in "$r"/*/; do
+    d=${d%/}; [ -f "$d/manifest.json" ] || continue
+    url=""; head=""; dirty=""
+    if [ -d "$d/.git" ] && [ "${HAVE_GIT:-1}" = 1 ]; then
+      url=$(norm "$(G -C "$d" config --get remote.origin.url 2>/dev/null)")
+      head=$(G -C "$d" rev-parse --short HEAD 2>/dev/null)
+      [ -n "$(G -C "$d" status --porcelain --untracked-files=no 2>/dev/null | head -n 1)" ] && dirty=1
+    fi
+    ver=$(sed -n "s/.*\"version\"[^\"]*\"\([^\"]*\)\".*/\1/p" "$d/manifest.json" | head -n 1)
+    printf "%s\t%s\t%s\t%s\t%s\n" "$d" "$url" "$head" "$dirty" "$ver"
+  done
+done'
+}
+
+export_extensions() {
+  command -v python3 >/dev/null || return 0
+  ct_ext_index > "$TMPD/extidx" 2>/dev/null || { warn "Не вышло прочитать список расширок."; return 0; }
+  mkdir -p "$TMPD/export"
+  python3 - "$TMPD/extidx" "$TMPD/export/$EXT_INDEX" <<'PYEOF' || { warn "Список расширок не собрался."; return 0; }
+import json, sys
+rows = []
+for line in open(sys.argv[1], encoding='utf-8', errors='replace'):
+    p = line.rstrip('\n').split('\t')
+    if len(p) < 5:
+        continue
+    folder, url, head, dirty, ver = p[:5]
+    rows.append({'path': folder, 'repo': url or None, 'commit': head or None, 'localChanges': dirty == '1', 'version': ver or None})
+rows.sort(key=lambda r: r['path'].lower())
+open(sys.argv[2], 'w', encoding='utf-8').write(json.dumps(rows, ensure_ascii=False, indent=2) + '\n')
+PYEOF
+  mkdir -p "$MIRROR/$EXPORT_DIR"
+  cp -- "$TMPD/export/$EXT_INDEX" "$MIRROR/$EXPORT_DIR/"
+}
+
+# одна строка списка → в контейнере: подтянуть / поставить / убрать. Печатает итог одним словом и подробности.
+ct_ext_apply() { # $1 pull|install|remove, $2 ссылка или папка, $3 владелец uid:gid, $4 папка для бэкапа
+  ct_sh "$EXT_SH_LIB"'
+act=$1; arg=$2; owner=$3; trash=$4
+command -v git >/dev/null 2>&1 || { echo "nogit"; exit 0; }
+mkdir -p extensions
+stamp=$(date +%Y%m%d-%H%M%S)
+if [ "$act" = remove ]; then
+  [ -d "extensions/$arg" ] || { echo "absent"; exit 0; }
+  mkdir -p "$trash" && mv "extensions/$arg" "$trash/$arg-$stamp" && echo "removed $trash/$arg-$stamp"; exit 0
+fi
+url=$(norm "$arg")
+found=""
+for r in $(roots); do
+  for d in "$r"/*/; do
+    d=${d%/}; [ -d "$d/.git" ] || continue
+    [ "$(norm "$(G -C "$d" config --get remote.origin.url 2>/dev/null)")" = "$url" ] && { found=$d; break 2; }
+  done
+done
+if [ -n "$found" ]; then
+  if [ -n "$(G -C "$found" status --porcelain --untracked-files=no 2>/dev/null | head -n 1)" ]; then echo "dirty $found"; exit 0; fi
+  old=$(G -C "$found" rev-parse --short HEAD 2>/dev/null)
+  if ! G -C "$found" pull -q --ff-only >/dev/null 2>&1; then echo "pullfail $found"; exit 0; fi
+  new=$(G -C "$found" rev-parse --short HEAD 2>/dev/null)
+  chown -R "$owner" "$found" 2>/dev/null
+  if [ "$old" = "$new" ]; then echo "same $found $new"; else echo "updated $found $old $new"; fi
+  exit 0
+fi
+[ "$act" = install ] || { echo "notfound $url"; exit 0; }
+name=${url##*/}
+if [ -e "extensions/$name" ]; then echo "busy extensions/$name"; exit 0; fi
+if ! G clone -q --depth 1 "$arg" "extensions/$name" >/dev/null 2>&1; then rm -rf "extensions/$name"; echo "clonefail $name"; exit 0; fi
+chown -R "$owner" "extensions/$name" 2>/dev/null
+echo "cloned extensions/$name $(G -C "extensions/$name" rev-parse --short HEAD 2>/dev/null)"' "$@"
+}
+
+ext_sync() {
+  local list owner line a b res word rest changed=0
+  local -a missing=()
+  if [[ -n ${EXT_FROM_ORIGIN:-} ]]; then
+    list=$(g show "origin/$BRANCH:$EXT_LIST" 2>/dev/null || g show "HEAD:$EXT_LIST" 2>/dev/null || true)
+  else
+    list=$(g show "HEAD:$EXT_LIST" 2>/dev/null || g show "origin/$BRANCH:$EXT_LIST" 2>/dev/null || true)
+  fi
+  [[ -n $list ]] || return 0
+  owner=$(ct_owner)
+  while IFS= read -r line; do
+    line=${line%%#*}; read -r a b _ <<<"$line" || true
+    [[ -n ${a:-} ]] || continue
+    local act=pull
+    if [[ $a == + ]]; then act=install; a=${b:-}; b=""; fi
+    if [[ $a == - ]]; then
+      if [[ ! ${b:-} =~ ^[A-Za-z0-9._-]+$ || $b == . || $b == .. ]]; then warn "Расширки: странное имя папки «${b:-}» — пропускаю."; continue; fi
+      res=$(ct_ext_apply remove "$b" "$owner" "$EXT_TRASH" | tail -n 1) || res="fail"
+    else
+      if [[ ! $a =~ $EXT_ALLOW ]]; then warn "Расширки: не своя ссылка «$a» — не ставлю."; continue; fi
+      res=$(ct_ext_apply "$act" "$a" "$owner" "$EXT_TRASH" | tail -n 1) || res="fail"
+    fi
+    word=${res%% *}; rest=${res#"$word"}; rest=${rest# }
+    case $word in
+      updated)   a=${rest%% *}; b=${rest#* }; say "🧩 Обновлена: ${a##*/} (${b/ / → })"; changed=1 ;;
+      cloned)    a=${rest%% *}; say "🧩 Поставлена: ${a##*/}"; changed=1 ;;
+      removed)   say "🧩 Убрана: $b (лежит в ${rest})"; changed=1 ;;
+      notfound)  missing+=("${rest##*/}") ;;
+      same|absent) ;;
+      dirty)     warn "Расширки: в ${rest} есть свои правки — не обновляю." ;;
+      busy)      warn "Расширки: папка ${rest} уже занята другим — не ставлю." ;;
+      pullfail)  warn "Расширки: ${rest} не обновилась (git pull) — проверь сеть." ;;
+      clonefail) warn "Расширки: ${rest} не скачалась — проверь сеть." ;;
+      nogit)     warn "Расширки: в контейнере нет git — пропускаю."; return 0 ;;
+      *)         warn "Расширки: ${a} ${b:-} — непонятный ответ: ${res}" ;;
+    esac
+  done <<<"$list"
+  if (( ${#missing[@]} )); then say "   Расширки из списка, которых на сервере нет (сама не ставлю): ${missing[*]}"; fi
+  if (( changed )); then say "   Расширки поменялись — обнови страницу ST."; fi
+  return 0
+}
+
+cmd_ext() {
+  mirror_ready || die "Сначала: st-sync setup"
+  ct_check
+  lock
+  g fetch -q origin 2>/dev/null || warn "Нет связи с GitHub — беру список расширок из последней репы."
+  local list
+  list=$(g show "origin/$BRANCH:$EXT_LIST" 2>/dev/null || true)
+  if [[ -n $list ]] && ! g merge-base --is-ancestor "origin/$BRANCH" HEAD 2>/dev/null; then
+    say "Есть и правки данных от Claude — их применит обычный st-sync. Здесь — только расширки."
+  fi
+  # в «только расширки» берём список из свежей репы, даже если данные ещё не слиты
+  EXT_FROM_ORIGIN=1 ext_sync
+}
+
 # ---------- снимок сервера ----------
 
 snapshot() { # $1 — текст коммита
@@ -225,6 +381,7 @@ snapshot() { # $1 — текст коммита
   done
   export_settings
   export_chats
+  export_extensions
   rm -rf "$TMPD"; TMPD=""
 
   g add -A -- "${DIRS[@]}"
@@ -498,6 +655,11 @@ after_apply_hint() {
 # ---------- команды ----------
 
 cmd_sync() {
+  cmd_sync_data
+  ext_sync
+}
+
+cmd_sync_data() {
   mirror_ready || die "Сначала: st-sync setup"
   ct_check
   lock
@@ -676,6 +838,7 @@ case "${1:-sync}" in
   status)  cmd_status ;;
   setup)   cmd_setup ;;
   update)  cmd_update ;;
-  help|-h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) die "Не знаю команду «$1». Есть: st-sync, st-sync undo, st-sync status, st-sync update, st-sync setup" ;;
+  ext)     cmd_ext ;;
+  help|-h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "Не знаю команду «$1». Есть: st-sync, st-sync ext, st-sync undo, st-sync status, st-sync update, st-sync setup" ;;
 esac

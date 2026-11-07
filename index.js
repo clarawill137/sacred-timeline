@@ -13,7 +13,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.7.1';
+const VERSION = '0.7.2';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true };
 const WHO_KEY = 'sacred_timeline_who';
@@ -30,6 +30,7 @@ let lastWho = null;      // сколько строк «кто есть кто»
 let lastBooks = null;    // книги эпохи: { added: [имена], missing: [имена], entries: n }
 let lastAvatar = null;   // аватар персоны: { avatar, base, missing, switched }
 let lastMemory = null;   // память эпохи: { book, bound, missing, other }
+let lastHistory = null;  // память прошлых эпох в промпте: { added: [книги], entries: n }
 let switchingPersona = false;
 
 function settings() {
@@ -241,6 +242,8 @@ export function judgeEntry(entry, { eraId, date, eraFrom, speaker, personaId, pe
     if (entry.disable) return 'keep';
     if (date && g.from && String(g.from) > date) return 'drop';
     if (g.secret && g.knows && typeof g.knows === 'object') {
+        // память своей эпохи: рассказчику и неопознанным NPC видна — сцены рассказывали они
+        if (g.kind === 'memory' && String(g.era) === String(eraId) && !speaker) return 'keep';
         const at = date || eraFrom;
         const spans = speaker ? g.knows[speaker] : null;
         return at && Array.isArray(spans) && spans.some(s => s.mode === 'knows' && covers(s, at)) ? 'keep' : 'drop';
@@ -264,13 +267,14 @@ export function eraBooksToAdd(payload, era) {
 }
 
 /** Записи книги — в globalLore, в той же форме, что у ST: { uid, world, ...rest }. Возвращает число записей. */
-export function addBook(payload, name, data) {
+export function addBook(payload, name, data, pick = null) {
     const entries = data?.entries;
     if (!entries || typeof entries !== 'object' || !Array.isArray(payload?.globalLore)) return 0;
     let n = 0;
     for (const key of Object.keys(entries)) {
         const raw = entries[key];
         if (!raw || typeof raw !== 'object') continue;
+        if (pick && !pick(raw)) continue;
         const { uid, ...rest } = raw;
         payload.globalLore.push({ uid, world: name, ...rest });
         n++;
@@ -312,6 +316,22 @@ export function scopeFor(data, era, date, c) {
  */
 export function visibleEntries(entries, world, scope, books) {
     return (entries || []).filter(e => e && judgeEntry({ ...e, world, disable: false }, scope, books) !== 'drop');
+}
+
+/** Память прошлых эпох — только размеченные записи (дата и кто знает); дальше их режет общий фильтр. */
+async function joinHistory(payload, data, era) {
+    const out = { added: [], entries: 0 };
+    const have = new Set();
+    for (const key of LORE_KEYS) for (const e of payload?.[key] || []) if (e?.world) have.add(e.world);
+    const known = ctx().getWorldInfoNames?.();
+    for (const name of historyBooks(data, era)) {
+        if (have.has(name) || (Array.isArray(known) && !known.includes(name))) continue;
+        let book = null;
+        try { book = await ctx().loadWorldInfo(name); } catch { /* нет книги — нет истории */ }
+        const n = addBook(payload, name, book, isTaggedMemory);
+        if (n) { out.added.push(name); out.entries += n; }
+    }
+    return out;
 }
 
 export function filterLore(payload, scope, books) {
@@ -616,6 +636,81 @@ async function bindEraMemory(era, explicit, chatId) {
     try { window.toastr?.info(msg, 'Священный таймлайн', { timeOut: 8000 }); } catch { /* ignore */ }
 }
 
+/**
+ * Меморибуки эпох раньше этой (у которых ядро ведёт память, bindMemory) — их эта эпоха видит как историю:
+ * размеченные записи (дата, кто знает) идут в промпт через тот же фильтр, что и всё остальное.
+ */
+export function historyBooks(data, era) {
+    if (!era?.from) return [];
+    return records(data, 'era')
+        .filter(e => e.bindMemory && e.memoryBook && String(e.id) !== String(era.id) && e.from && String(e.from) < String(era.from))
+        .sort((a, b) => String(a.from).localeCompare(String(b.from)))
+        .map(e => e.memoryBook);
+}
+
+/** Запись STMemoryBooks — память сцены. */
+export const isMemoryEntry = e => !!e && (e.STMB_start !== undefined || e.stmemorybooks !== undefined);
+
+/** В историю других эпох уходит только размеченная память: без даты и знания запись остаётся в своей эпохе. */
+export const isTaggedMemory = e => e?.gc?.kind === 'memory';
+
+/**
+ * Разметить свежие записи STMB в меморибуке эпохи: дата сцены (по трекеру/Horae у последнего сообщения сцены,
+ * иначе дата чата), эпоха, кто был в сцене — те и знают, откуда (чат, сообщения). Размеченные не трогает.
+ * Возвращает число размеченных.
+ */
+export function tagMemories(book, { data, era, chat, md, chatId }) {
+    let n = 0;
+    const list = Array.isArray(chat) ? chat : [];
+    const persona = personaIdentity(data);
+    for (const e of Object.values(book?.entries || {})) {
+        if (!isMemoryEntry(e) || e.gc) continue;
+        const b = Number(e.STMB_end);
+        const end = Number.isFinite(b) ? Math.min(b, list.length - 1) : list.length - 1;
+        const a = Number(e.STMB_start);
+        const start = Number.isFinite(a) ? Math.max(0, a) : Math.max(0, end);
+        const scene = list.slice(0, end + 1);
+        const date = clampDate(storyDate({}, scene).date || storyDate(md, list).date, era) || era.from || null;
+        const who = [];
+        for (const m of scene.slice(start)) {
+            if (!m || m.is_system) continue;
+            const id = m.is_user ? persona : speakerOf(data, { avatar: m.original_avatar, name: m.name }, m.name);
+            if (id && !who.includes(id)) who.push(id);
+        }
+        const knows = {};
+        for (const id of who) knows[id] = [{ from: date, mode: 'knows' }];
+        e.gc = { v: 1, kind: 'memory', era: String(era.id), from: date, who, secret: true, knows,
+            src: { era: String(era.id), chat: chatId || null, msgs: [start, end] }, status: 'canon' };
+        n++;
+    }
+    return n;
+}
+
+let tagging = false;
+/** Разметить память эпохи в её каноничном чате (после записи STMB и при входе в чат). */
+async function tagEraMemory(name, book) {
+    if (tagging) return 0;
+    const c = ctx();
+    const chatId = c.getCurrentChatId?.();
+    const { data, era, explicit } = await resolve();
+    if (!data || !explicit || !era?.bindMemory || !era.memoryBook || chatId !== era.canonChat) return 0;
+    if (name && name !== era.memoryBook) return 0;
+    if (c.chatMetadata?.world_info !== era.memoryBook) return 0;
+    tagging = true;
+    try {
+        const b = book || await c.loadWorldInfo?.(era.memoryBook);
+        if (!b?.entries) return 0;
+        const n = tagMemories(b, { data, era, chat: c.chat, md: c.chatMetadata, chatId });
+        if (n) {
+            await c.saveWorldInfo?.(era.memoryBook, b, true);
+            console.log(TAG, `память эпохи ${era.id}: размечено записей — ${n}`);
+        }
+        return n;
+    } finally {
+        tagging = false;
+    }
+}
+
 // ───────────── контракт для расширок ─────────────
 //
 // Ядро не лезет в настройки чужих расширок. Три рычага:
@@ -766,7 +861,8 @@ export function buildContext(data, cur, c) {
         v: 1,
         world: w ? { id: w.id || null, name: w.name || null, chronicle: w.chronicle || null } : null,
         era: { id: String(era.id), label: era.label || '', from: era.from || null, to: era.to || null,
-            status: era.status || null, memoryBook: era.memoryBook || null, lore: [...(era.lore || [])] },
+            status: era.status || null, memoryBook: era.memoryBook || null, history: historyBooks(data, era),
+            lore: [...(era.lore || [])] },
         explicit: !!cur.explicit,
         chatId: cur.chatId || null,
         date: cur.date || null,
@@ -892,6 +988,7 @@ async function onChatChanged({ reset = true } = {}) {
         lastBooks = null;
         lastAvatar = null;
         lastMemory = null;
+        lastHistory = null;
         ctx().setExtensionPrompt?.(WHO_KEY, '', IN_CHAT, WHO_DEPTH, false, ROLE_SYSTEM);
     }
     const { data, era, explicit, date, md } = await resolve();
@@ -900,6 +997,7 @@ async function onChatChanged({ reset = true } = {}) {
     }
     if (reset && ctx().getCurrentChatId?.() === chatId) {
         try { await bindEraMemory(era, explicit, chatId); } catch (e) { console.warn(TAG, 'память эпохи не привязана', e); }
+        try { await tagEraMemory(); } catch (e) { console.warn(TAG, 'память эпохи не размечена', e); }
     }
     if (ctx().getCurrentChatId?.() === chatId) {
         try { await publish(data); } catch (e) { console.warn(TAG, 'снимок для расширок не разослан', e); }
@@ -924,6 +1022,7 @@ async function onEntriesLoaded(payload) {
         if (!data || !era) return;
         // книги эпохи — только в чатах, отмеченных в Реестре; дальше они проходят тот же фильтр, что и все
         lastBooks = explicit ? await joinEraBooks(payload, era) : null;
+        lastHistory = explicit ? await joinHistory(payload, data, era) : null;
         const scope = scopeFor(data, era, date, ctx());
         lastLore = filterLore(payload, scope, worldRecord(data)?.books || {});
         lastLore.speaker = scope.speaker ? (records(data, 'identity').find(g => g.id === scope.speaker)?.name || scope.speaker) : null;
@@ -1032,6 +1131,7 @@ function statusLines() {
         else if (lastMemory.other) out.push(`Память эпохи — «${esc(lastMemory.book)}», а у чата своя книга «${esc(lastMemory.other)}»${lastMemory.canon ? ' (не трогаю)' : ''}`);
         else if (!lastMemory.canon) out.push(`Память эпохи — «${esc(lastMemory.book)}» (этот чат не каноничный — книгу не ставлю)`);
     }
+    if (lastHistory?.added?.length) out.push(`Память прошлых эпох: ${esc(lastHistory.added.join(', '))} — записей ${lastHistory.entries} (дальше — по дате и кто знает)`);
     if (!settings().who) out.push('Кто есть кто: выключено');
     else if (lastWho !== null) out.push(lastWho ? `Кто есть кто: ${lastWho} ${plural(lastWho, 'строка', 'строки', 'строк')} в промпте` : 'Кто есть кто: для этой эпохи нет');
     return out;
@@ -1116,6 +1216,8 @@ if (typeof jQuery === 'function') {
         eventSource.on(eventTypes.WORLDINFO_ENTRIES_LOADED, onEntriesLoaded);
         eventSource.on(eventTypes.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
         if (eventTypes.GENERATION_STARTED) eventSource.on(eventTypes.GENERATION_STARTED, onGenerationStarted);
+        // STMB сохранил память сцены — разметить дату и кто знает
+        if (eventTypes.WORLDINFO_UPDATED) eventSource.on(eventTypes.WORLDINFO_UPDATED, safe((name, book) => tagEraMemory(name, book)));
         registerSlash();
         window.SacredTimeline = {
             version: VERSION,
@@ -1130,7 +1232,8 @@ if (typeof jQuery === 'function') {
             visible: async (entries, world) => {
                 const { data, era, date } = await resolve();
                 if (!data || !era) return [...(entries || [])];
-                return visibleEntries(entries, world, scopeFor(data, era, date, ctx()), worldRecord(data)?.books || {});
+                const list = historyBooks(data, era).includes(world) ? (entries || []).filter(isTaggedMemory) : entries;
+                return visibleEntries(list, world, scopeFor(data, era, date, ctx()), worldRecord(data)?.books || {});
             },
             era: () => ({ ...current }),
             registry: loadRegistry,
