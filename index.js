@@ -7,7 +7,7 @@
 //  • «кто есть кто» — короткая шпаргалка эпохи на дату сюжета в промпт (строки эпохи + кого здесь нет и почему);
 //  • книги эпохи (era.lore) — сам подключает их в чатах отмеченной эпохи, без глобальных настроек ST;
 //  • аватар персоны по эпохе: у обличья эпохи свой файл в User Avatars — ядро заводит персону-двойника
-//    (то же имя и описание) и переключает на неё в чатах эпохи; уходя из них — возвращает базовую.
+//    (то же имя, описание — уже с правками эпохи) и переключает на неё в чатах эпохи; уходя — возвращает базовую.
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
@@ -316,17 +316,23 @@ export function filterLore(payload, scope, books) {
 // ───────────── персона ─────────────
 
 /** Правки персоны эпохи — внутри текста персоны в промпте. Возвращает число применённых правок. */
-export function patchPersona(messages, description, patches) {
-    const desc = String(description || '').trim();
-    if (!desc || !Array.isArray(patches) || !patches.length) return 0;
-    let fixed = desc;
+/** Правки эпохи (find → replace) к тексту персоны. Возвращает новый текст и число сработавших правок. */
+export function patchText(text, patches) {
+    let fixed = String(text ?? '');
     let n = 0;
-    for (const p of patches) {
+    for (const p of Array.isArray(patches) ? patches : []) {
         if (p?.find && fixed.includes(p.find)) {
             fixed = fixed.split(p.find).join(p.replace ?? '');
             n++;
         }
     }
+    return { text: fixed, n };
+}
+
+export function patchPersona(messages, description, patches) {
+    const desc = String(description || '').trim();
+    if (!desc || !Array.isArray(patches) || !patches.length) return 0;
+    const { text: fixed, n } = patchText(desc, patches);
     if (!n) return 0;
     let hit = false;
     for (const m of messages || []) {
@@ -380,12 +386,17 @@ export function wantedPersona(av, explicit, current, mine = []) {
     return target && target !== current ? target : null;
 }
 
-/** Двойник базовой персоны под аватар эпохи: то же имя и описание, без привязок к персонажам. */
-export function clonePersona(pu, base, avatar) {
+/**
+ * Двойник базовой персоны под аватар эпохи: то же имя, описание — базовое с правками эпохи (его видят и другие
+ * расширки, читающие персону), без привязок к персонажам.
+ */
+export function clonePersona(pu, base, avatar, patches = []) {
     const desc = pu?.persona_descriptions?.[base];
     if (!pu?.personas?.[base] || !desc) return false;
     pu.personas[avatar] = pu.personas[base];
-    pu.persona_descriptions[avatar] = { ...JSON.parse(JSON.stringify(desc)), connections: [] };
+    const copy = JSON.parse(JSON.stringify(desc));
+    copy.description = patchText(copy.description, patches).text;
+    pu.persona_descriptions[avatar] = { ...copy, connections: [] };
     return true;
 }
 
@@ -432,7 +443,7 @@ async function syncPersonaAvatar(data, era, explicit) {
     const pu = c.powerUserSettings;
     if (target !== av.base && pu && (!pu.personas?.[target] || mine.includes(target))) {
         // двойник держится в ногу с базовой персоной: правишь её — двойник обновится при следующем входе
-        if (clonePersona(pu, av.base, target) && !mine.includes(target)) mine.push(target);
+        if (clonePersona(pu, av.base, target, era.personaPatches) && !mine.includes(target)) mine.push(target);
         c.saveSettingsDebounced?.();
     }
     switchingPersona = true;
@@ -696,7 +707,9 @@ function statusLines() {
     } else {
         out.push('Лорбуки: покажу после первой генерации.');
     }
-    if (lastPersona !== null) out.push(lastPersona ? `Персона: срез эпохи — правок ${lastPersona}` : 'Персона: без правок');
+    const twin = lastAvatar?.avatar && lastAvatar.avatar !== lastAvatar.base;
+    if (twin && !lastPersona) out.push('Персона: двойник эпохи — описание уже под эпоху');
+    else if (lastPersona !== null) out.push(lastPersona ? `Персона: срез эпохи — правок ${lastPersona}` : 'Персона: без правок');
     if (lastAvatar?.missing) out.push(`Аватар персоны эпохи «${esc(lastAvatar.missing)}» не найден в User Avatars — оставила как есть`);
     else if (lastAvatar?.avatar && lastAvatar.avatar !== lastAvatar.base) out.push(`Аватар персоны: ${esc(lastAvatar.avatar)} (эпоха)`);
     if (!settings().who) out.push('Кто есть кто: выключено');
