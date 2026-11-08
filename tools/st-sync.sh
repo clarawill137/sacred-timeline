@@ -181,6 +181,24 @@ recover_git() {
   if g rev-parse -q --verify HEAD >/dev/null; then g reset -q --hard HEAD; fi
 }
 
+# Прошлый запуск оборвался между слиянием «применить правки Claude» и отправкой в репу (вопрос остался без
+# ответа, окно закрылось, запись на сервер сорвалась). Тогда на сервере старые файлы, а снимок поверх такого
+# слияния записал бы их как правку на сервере — и молча откатил бы правки Claude. Возвращаю зеркало к снимку до
+# слияния: правки Claude ждут в origin и применятся в этот раз.
+drop_unsent_merge() {
+  g rev-parse -q --verify HEAD >/dev/null || return 0
+  has_origin_main || return 0
+  [[ $(g log -1 --format=%s HEAD) == "применить правки Claude" ]] || return 0
+  g rev-parse -q --verify 'HEAD^2' >/dev/null || return 0
+  if g merge-base --is-ancestor HEAD "origin/$BRANCH"; then return 0; fi
+  local merge; merge=$(g rev-parse HEAD)
+  g reset -q --hard 'HEAD^1'
+  if [[ -s "$MIRROR/.git/st-sync-last" && $(<"$MIRROR/.git/st-sync-last") == "$merge" ]]; then
+    rm -f "$MIRROR/.git/st-sync-last"
+  fi
+  warn "Прошлый st-sync не дошёл до конца — правки Claude применю заново."
+}
+
 lock() {
   exec 9>"$MIRROR/.git/st-sync.lock"
   command -v flock >/dev/null && { flock -n 9 || die "st-sync уже запущен в другом окне."; }
@@ -667,6 +685,7 @@ cmd_sync_data() {
   fix_thumbs
   say "⏳ Снимаю сервер…"
   g fetch -q origin 2>/dev/null || die "Нет связи с GitHub. Запусти: st-sync setup"
+  drop_unsent_merge
   snapshot "сервер: снимок $(date '+%Y-%m-%d %H:%M')"
   g rev-parse -q --verify HEAD >/dev/null || die "На сервере не нашлось ни лорбуков, ни пресетов — проверь контейнер $CT."
   local snap; snap=$(g rev-parse HEAD)
