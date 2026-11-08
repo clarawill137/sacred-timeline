@@ -15,7 +15,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.9.6';
+const VERSION = '0.9.7';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true, chronicle: true, strazh: true, chronist: true, reviser: '' };
 const WHO_KEY = 'sacred_timeline_who';
@@ -2409,6 +2409,10 @@ if (typeof jQuery === 'function') {
             },
         };
         if (ctx().getCurrentChatId?.()) onChatChanged().catch(e => console.warn(TAG, e));
+        // «Ход» — кнопка «кто ответит» у поля ввода: свой модуль, от ядра берёт только публичное (context, present)
+        if (typeof document !== 'undefined' && typeof document.createElement === 'function' && typeof document.addEventListener === 'function') {
+            import('./hod.js').then(m => m.initHod()).catch(e => console.warn(TAG, 'Ход', e));
+        }
         console.log(TAG, 'загружено', VERSION);
     });
 }
