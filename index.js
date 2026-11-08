@@ -15,7 +15,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.9.5';
+const VERSION = '0.9.6';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true, chronicle: true, strazh: true, chronist: true, reviser: '' };
 const WHO_KEY = 'sacred_timeline_who';
@@ -1552,22 +1552,26 @@ export function buildContext(data, cur, c) {
     const sp = speakerId ? sliceOf(data, speakerId, { avatar: ch?.avatar, date: cur.date || era.from }) : null;
     const pr = sliceById(data, era.persona);
     // кто есть кто в этом чате по именам — для расширок, которые хранят данные по имени персонажа (шкаф, жизнь):
-    // имя → личность и её облик на дату чата; персона (name1) — облик эпохи
+    // имя → личность, её облик на дату чата и card — карточка, которой человек представлен в этом чате (у одного
+    // человека бывает несколько карточек с одним именем, по эпохам; расширкам, ищущим карточку по имени, — сюда).
+    // Несколько его карточек в одной группе (эпоха через годы) — облик по дате, card — карточка этого облика.
+    // Персона (name1) — облик эпохи.
     const people = {};
     const at = cur.date || era.from;
-    const addPerson = (name, avatar) => {
-        if (!name || people[name]) return;
-        const id = speakerOf(data, { avatar, name }, name);
-        if (!id) return;
-        const sl = sliceOf(data, id, { avatar, date: at });
-        people[name] = { identity: id, slice: sl?.id || null, label: sl?.label || null };
-    };
+    const here = new Map();
+    const note = (name, avatar) => { if (name && avatar) here.set(name, [...(here.get(name) || []), avatar]); };
     const group = c?.groupId ? (c.groups || []).find(g => g.id === c.groupId) : null;
-    for (const av of group?.members || []) {
-        const m = (c?.characters || []).find(x => x.avatar === av);
-        if (m) addPerson(m.name, m.avatar);
+    for (const av of group?.members || []) note((c?.characters || []).find(x => x.avatar === av)?.name, av);
+    if (!group && ch) note(ch.name, ch.avatar);
+    for (const [name, avatars] of here) {
+        const id = speakerOf(data, { avatar: avatars[0], name }, name);
+        if (!id) continue;
+        const sl = avatars.length > 1
+            ? (sliceOf(data, id, { date: at }) || sliceOf(data, id, { avatar: avatars[0] }))
+            : sliceOf(data, id, { avatar: avatars[0], date: at });
+        people[name] = { identity: id, slice: sl?.id || null, label: sl?.label || null,
+            card: avatars.includes(sl?.card) ? sl.card : avatars[0] };
     }
-    if (!group && ch) addPerson(ch.name, ch.avatar);
     if (pr && c?.name1) people[c.name1] = { identity: pr.identity.id, slice: pr.slice.id, label: pr.slice.label || null };
     return {
         v: 1,
