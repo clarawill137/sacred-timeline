@@ -4,6 +4,8 @@
 .sacred-timeline-settings small { opacity: 0.6; display: block; margin-top: 6px; }
 .sacred-timeline-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
 .sacred-timeline-row select { flex: 1; min-width: 0; }
+.sacred-timeline-row input { flex: 1; min-width: 0; margin: 0; }
+.sacred-timeline-date .menu_button { width: auto; margin: 0; padding: 3px 8px; white-space: nowrap; }
 /* канон: очередь Хроники и флажки Стража */
 .st-canon { margin: 8px 0; border-top: 1px solid var(--SmartThemeBorderColor, #444); padding-top: 6px; }
 .st-canon-h { font-weight: 600; margin-bottom: 6px; }

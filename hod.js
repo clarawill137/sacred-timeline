@@ -129,6 +129,7 @@ async function pump() {
         while (queue.length) {
             for (let t = 0; busy() && t < 1200; t++) await sleep(250);   // ждём, пока допишет (до пяти минут)
             const item = queue.shift();
+            if (!item) break;   // пока ждали, очередь сняли («стоп» или сменили чат)
             paintBadge();
             const draft = !item.own && String(textarea()?.value || '').trim() ? textarea().value : null;
             if (draft !== null) setText('');
@@ -164,7 +165,7 @@ function pick(m) {
     queue.push({ chid: m.chid, own: !later });
     paintBadge();
     if (later) globalThis.toastr?.info?.(`${m.short} — следом`, 'Ход', { timeOut: 1800 });
-    pump();
+    pump().catch(e => console.warn(TAG, e));
 }
 
 function clearQueue() {

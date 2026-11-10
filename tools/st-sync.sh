@@ -199,6 +199,82 @@ drop_unsent_merge() {
   warn "Прошлый st-sync не дошёл до конца — правки Claude применю заново."
 }
 
+# Сторож откатов. После применения правок Claude страницу ST надо обновить: иначе таверна (или расширка) при первом же
+# сохранении лорбука запишет свою старую копию поверх — и правки Claude молча пропадут. Здесь это видно: в свежем
+# снимке ($1 — что было до него) запись лорбука (или целый файл) вернулась к тому, что было ДО последнего применения.
+# Ничего не чинит — говорит вслух и оставляет пометку в истории репы (её увидит Claude).
+check_reverts() {
+  local before=${1:-} last pre snap out
+  command -v python3 >/dev/null || return 0
+  [[ -n $before ]] || return 0
+  snap=$(g rev-parse -q --verify HEAD) || return 0
+  [[ $snap != "$before" ]] || return 0
+  last=$(g log --first-parent -1 --format=%H --grep='^применить правки Claude$' "$before" 2>/dev/null || true)
+  [[ -n $last ]] || return 0
+  pre=$(g rev-parse -q --verify "$last^1" 2>/dev/null) || return 0
+  out=$(python3 - "$MIRROR" "$pre" "$last" "$before" "$snap" "${DIRS[@]}" <<'PYEOF' 2>/dev/null || true
+import json, subprocess, sys
+mirror, pre, last, before, snap = sys.argv[1:6]
+dirs = sys.argv[6:]
+
+def git(*a):
+    return subprocess.run(['git', '-C', mirror, *a], capture_output=True)
+
+def names(a, b):
+    out = git('diff', '--no-renames', '--name-only', '-z', a, b, '--', *dirs).stdout.decode('utf-8', 'replace')
+    return {n for n in out.split('\0') if n}
+
+def blob(rev, path):
+    r = git('rev-parse', '-q', '--verify', f'{rev}:{path}')
+    return r.stdout.decode().strip() if r.returncode == 0 else None
+
+def entries(rev, path):
+    r = git('show', f'{rev}:{path}')
+    if r.returncode:
+        return None
+    try:
+        e = json.loads(r.stdout.decode('utf-8')).get('entries')
+        return e if isinstance(e, dict) else {}
+    except Exception:
+        return None
+
+for path in sorted(names(pre, last) & names(before, snap)):
+    # файл целиком вернулся к тому, что было до применения
+    if blob(before, path) == blob(last, path) and blob(snap, path) == blob(pre, path):
+        print(f'{path}\tцеликом')
+        continue
+    if not (path.startswith('worlds/') and path.endswith('.json')):
+        continue
+    a, b, c, d = (entries(r, path) for r in (pre, last, before, snap))
+    if b is None or d is None:
+        continue
+    a, c = a or {}, c or {}
+    n = 0
+    for k, v in b.items():
+        # запись, которую менял (или добавил) Claude, стояла как у него — и вернулась к старой (или пропала)
+        if a.get(k) != v and c.get(k) == v and d.get(k) == a.get(k):
+            n += 1
+    for k, v in a.items():
+        # запись, которую Claude убрал, вернулась
+        if k not in b and k not in c and d.get(k) == v:
+            n += 1
+    if n:
+        print(f'{path}\tзаписей: {n}')
+PYEOF
+  )
+  [[ -n $out ]] || return 0
+  warn "На сервере откатились правки Claude (похоже, страницу ST не обновили после прошлого применения):"
+  local line n note=""
+  while IFS=$'\t' read -r line n; do
+    [[ -n $line ]] || continue
+    printf '   %s — %s\n' "$line" "$n" >&2
+    note+="${line##*/} — $n; "
+  done <<<"$out"
+  say "   Скажи Claude: «откат» — он вернёт. Перед этим обнови страницу ST."
+  g commit -q --allow-empty -m "⚠ сервер: откатились правки Claude — ${note%; }" 2>/dev/null || true
+  return 0
+}
+
 lock() {
   exec 9>"$MIRROR/.git/st-sync.lock"
   command -v flock >/dev/null && { flock -n 9 || die "st-sync уже запущен в другом окне."; }
@@ -436,7 +512,6 @@ out = {
 open(sys.argv[2], 'w', encoding='utf-8').write(json.dumps(out, ensure_ascii=False, indent=2) + '\n')
 PYEOF
   then
-    rm -rf -- "${MIRROR:?}/$EXPORT_DIR"
     mkdir -p "$MIRROR/$EXPORT_DIR"
     cp -- "$TMPD/export/settings-safe.json" "$MIRROR/$EXPORT_DIR/"
   else
@@ -686,8 +761,10 @@ cmd_sync_data() {
   say "⏳ Снимаю сервер…"
   g fetch -q origin 2>/dev/null || die "Нет связи с GitHub. Запусти: st-sync setup"
   drop_unsent_merge
+  local before; before=$(g rev-parse -q --verify HEAD 2>/dev/null || true)
   snapshot "сервер: снимок $(date '+%Y-%m-%d %H:%M')"
   g rev-parse -q --verify HEAD >/dev/null || die "На сервере не нашлось ни лорбуков, ни пресетов — проверь контейнер $CT."
+  check_reverts "$before"
   local snap; snap=$(g rev-parse HEAD)
 
   if ! has_origin_main; then

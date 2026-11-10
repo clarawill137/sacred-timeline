@@ -15,7 +15,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.9.7';
+const VERSION = '0.9.8';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true, chronicle: true, strazh: true, chronist: true, reviser: '' };
 const WHO_KEY = 'sacred_timeline_who';
@@ -192,17 +192,24 @@ function infoBoxDate(ib) {
     return m ? m[1] : null;
 }
 
-/** Где сейчас сюжет: метка в чате → трекер RPG Companion → трекер в тексте ответа → Horae → ничего. */
+/**
+ * Где сейчас сюжет: метка в чате → трекер RPG Companion → трекер в тексте ответа → Horae → ничего.
+ * Метка бывает двух видов. Просто дата (md.date) — жёстко: дата чата, пока метку не снимут. Дата «с этого места»
+ * (md.date + md.dateAt — сколько сообщений было в чате, когда её поставили): действует, пока в сообщениях после неё
+ * не появится своя дата (трекер, Horae) — дальше сюжет снова ведут они.
+ */
 export function storyDate(md, chat) {
     const mark = md?.[MODULE]?.date;
-    if (mark) return { date: String(mark), source: 'метка чата' };
+    const markAt = Number.isInteger(md?.[MODULE]?.dateAt) ? md[MODULE].dateAt : null;
+    if (mark && markAt === null) return { date: String(mark), source: 'метка чата' };
     const rc = md?.rpg_companion;
-    for (const box of [rc?.committedTrackerData?.infoBox, rc?.lastGeneratedData?.infoBox]) {
+    for (const box of mark ? [] : [rc?.committedTrackerData?.infoBox, rc?.lastGeneratedData?.infoBox]) {
         const d = parseStoryDate(infoBoxDate(box));
         if (d) return { date: d, source: 'трекер' };
     }
     const list = Array.isArray(chat) ? chat : [];
-    for (let i = list.length - 1; i >= Math.max(0, list.length - 40); i--) {
+    const floor = mark ? Math.max(0, markAt) : 0;
+    for (let i = list.length - 1; i >= Math.max(floor, list.length - 40); i--) {
         const msg = list[i];
         const sw = msg?.extra?.rpg_companion_swipes;
         const box = sw && (sw[String(msg.swipe_id ?? 0)] || sw['0'])?.infoBox;
@@ -213,15 +220,49 @@ export function storyDate(md, chat) {
         d = parseStoryDate(msg?.horae_meta?.timestamp?.story_date);
         if (d) return { date: d, source: 'Horae' };
     }
+    if (mark) return { date: String(mark), source: 'метка чата — с этого места' };
     return { date: null, source: '' };
 }
 
-/** Дата не выходит за рамки эпохи (трекеры иногда уползают). */
+/**
+ * Поставить дату сюжета «с этого места» (md.date + md.dateAt) или снять метку (пусто, «off», «нет», «сброс»).
+ * Понимает и «1961-03», и «15.03.1961», и «март 1961», и просто год. Возвращает дату, '' (снято) или null (не разобрал).
+ */
+export function setDateMark(md, value, chatLength = 0) {
+    if (!md || typeof md !== 'object') return null;
+    const raw = String(value ?? '').trim();
+    const store = md[MODULE] && typeof md[MODULE] === 'object' ? md[MODULE] : (md[MODULE] = {});
+    if (!raw || /^(off|нет|сброс|снять|-)$/i.test(raw)) {
+        delete store.date;
+        delete store.dateAt;
+        return '';
+    }
+    const date = /^\d{4}(-\d{2}){0,2}$/.test(raw) ? raw : parseStoryDate(raw);
+    if (!date) return null;
+    store.date = date;
+    store.dateAt = Math.max(0, Number(chatLength) || 0);
+    return date;
+}
+
+/**
+ * Дата не выходит за рамки эпохи (трекеры иногда уползают). Последний месяц (или год) эпохи — её целиком: день внутри
+ * него остаётся днём («по 1962-10» — это весь октябрь, а не его первое число).
+ */
 export function clampDate(date, era) {
     if (!date || !era) return date;
     if (era.from && date < era.from) return era.from;
-    if (era.to && date > era.to) return era.to;
+    if (era.to && date > era.to && !String(date).startsWith(String(era.to))) return era.to;
     return date;
+}
+
+/**
+ * Стык эпох. Месяц (или год), которым эпоха кончается, — общий с тем, что начинается следом: её финал играется в нём.
+ * Пока дата внутри него, всё, что кончается ровно этим месяцем (человек погибает в финале, облик меняется после), в
+ * этой эпохе ещё длится. Возвращает этот месяц (era.to) или null — тогда отрезки считаются как обычно.
+ * era.over — дата чата ушла за конец эпохи (трекер или метка): финал сыгран, края больше нет.
+ */
+export function edgeOf(era, date) {
+    return era?.to && !era.over && date && String(date).startsWith(String(era.to)) ? String(era.to) : null;
 }
 
 // ───────────── личности ─────────────
@@ -243,11 +284,14 @@ export function findIdentity(data, name) {
     return null;
 }
 
-/** Есть ли личность в мире на дату: дата попадает в один из отрезков её линии жизни. */
-export function presentAt(identity, date) {
+/**
+ * Есть ли личность в мире на дату: дата попадает в один из отрезков её линии жизни. edge — последний месяц эпохи
+ * (edgeOf): отрезок, который кончается ровно им, в этой эпохе ещё длится — человек доживает до финала.
+ */
+export function presentAt(identity, date, edge = null) {
     const tl = identity?.timeline || [];
     if (!tl.length || !date) return true;
-    return tl.some(s => (s.from == null || s.from <= date) && (s.to == null || date < s.to));
+    return tl.some(s => (s.from == null || s.from <= date) && (s.to == null || date < s.to || (!!edge && String(s.to) === String(edge))));
 }
 
 /** Регэксп упоминаний личности — только по своим алиасам: общие с кем-то (один титул на двоих) не берём. */
@@ -275,8 +319,19 @@ export function mentionRegex(data, identity, rosterName) {
 // ───────────── лорбуки ─────────────
 
 const covers = (s, at) => (s.from == null || s.from <= at) && (s.to == null || at < s.to);
-/** gc.public: true — знают все; дата — тайна до неё, дальше знают все (силы стали новостью и т. п.). */
-const isPublic = (g, at) => g?.public === true || (typeof g?.public === 'string' && !!at && String(g.public) <= String(at));
+/**
+ * Знает ли на дату (отрезки карты знания, mode «knows»). edge — последний месяц эпохи (edgeOf): знание, которое
+ * приходит ровно в нём, — это её финал (раскрытие, признание): пока он не сыгран, знанием оно не считается. В
+ * следующей эпохе — знает.
+ */
+export const knowsOn = (spans, at, edge = null) => Array.isArray(spans)
+    && spans.some(s => s && s.mode === 'knows' && covers(s, at) && !(edge && s.from != null && String(s.from) === String(edge)));
+/**
+ * gc.public: true — знают все; дата — тайна до неё, дальше знают все (силы стали новостью и т. п.). Дата ровно в
+ * последний месяц эпохи (edge) — это её финал: пока идёт эта эпоха, ещё тайна.
+ */
+const isPublic = (g, at, edge = null) => g?.public === true
+    || (typeof g?.public === 'string' && !!at && String(g.public) <= String(at) && !(edge && String(g.public) === String(edge)));
 
 /**
  * Решение по записи лорбука для эпохи и даты.
@@ -291,7 +346,7 @@ const isPublic = (g, at) => g?.public === true || (typeof g?.public === 'string'
  * эпохи) или начинается с её конца (from ≥ to эпохи) — вон, хотя месяц стыка общий («по 2014-04» — включительно).
  * Возвращает 'keep' | 'drop' | 'enable'.
  */
-export function judgeEntry(entry, { eraId, date, eraFrom, eraTo, speaker, personaId, personaNow }, books) {
+export function judgeEntry(entry, { eraId, date, eraFrom, eraTo, speaker, personaId, personaNow, edge = null }, books) {
     const scope = books?.[entry?.world];
     if (scope && Array.isArray(scope.eras) && !scope.eras.includes(eraId)) return 'drop';
     const g = entry?.gc;
@@ -311,12 +366,12 @@ export function judgeEntry(entry, { eraId, date, eraFrom, eraTo, speaker, person
     if (!date && at && g.from && String(g.from) > at) return 'drop';
     // состояние видно только внутри своего отрезка (с from по to)
     if (at && g.kind === 'state' && g.to && String(at) > String(g.to) && !String(at).startsWith(String(g.to))) return 'drop';
-    if (g.secret && g.knows && typeof g.knows === 'object' && !isPublic(g, date || eraFrom)) {
+    if (g.secret && g.knows && typeof g.knows === 'object' && !isPublic(g, date || eraFrom, edge)) {
         // память своей эпохи: рассказчику и неопознанным NPC видна — сцены рассказывали они
         if (g.kind === 'memory' && String(g.era) === String(eraId) && !speaker) return 'keep';
         const at = date || eraFrom;
         const spans = speaker ? g.knows[speaker] : null;
-        return at && Array.isArray(spans) && spans.some(s => s.mode === 'knows' && covers(s, at)) ? 'keep' : 'drop';
+        return at && knowsOn(spans, at, edge) ? 'keep' : 'drop';
     }
     const lived = personaId && g.personal?.[personaId];
     if (lived && personaNow && String(lived).split('/')[0] > personaNow) return 'drop';
@@ -375,6 +430,8 @@ export function scopeFor(data, era, date, c) {
         date,
         eraFrom: era.from || null,
         eraTo: era.to || null,
+        edge: edgeOf(era, date),
+        over: !!era.over,
         speaker: speakerOf(data, c?.characters?.[c?.characterId], c?.name2),
         personaId: personaIdentity(data),
         personaNow: era.personaTime || date || era.from || null,
@@ -483,7 +540,6 @@ export function filterLore(payload, scope, books) {
 
 // ───────────── персона ─────────────
 
-/** Правки персоны эпохи — внутри текста персоны в промпте. Возвращает число применённых правок. */
 /** Правки эпохи (find → replace) к тексту персоны. Возвращает новый текст и число сработавших правок. */
 export function patchText(text, patches) {
     let fixed = String(text ?? '');
@@ -497,6 +553,7 @@ export function patchText(text, patches) {
     return { text: fixed, n };
 }
 
+/** Правки персоны эпохи — внутри текста персоны в промпте. Возвращает число применённых правок. */
 export function patchPersona(messages, description, patches) {
     const desc = String(description || '').trim();
     if (!desc || !Array.isArray(patches) || !patches.length) return 0;
@@ -555,10 +612,6 @@ export function wantedPersona(av, explicit, current, mine = []) {
 }
 
 /**
- * Двойник базовой персоны под аватар эпохи: то же имя, описание — базовое с правками эпохи (его видят и другие
- * расширки, читающие персону), без привязок к персонажам.
- */
-/**
  * ST сам заводит персону «[Unnamed Persona]» с пустым описанием для каждой новой картинки в User Avatars.
  * Это заглушка, а не персона, которую завели руками, — двойник её спокойно заменяет.
  */
@@ -569,6 +622,10 @@ export function isPlaceholderPersona(pu, avatar) {
     return !desc && (!name || /^\[.*\]$/.test(name));
 }
 
+/**
+ * Двойник базовой персоны под аватар эпохи: то же имя, описание — базовое с правками эпохи (его видят и другие
+ * расширки, читающие персону), без привязок к персонажам.
+ */
 export function clonePersona(pu, base, avatar, patches = []) {
     const desc = pu?.persona_descriptions?.[base];
     if (!pu?.personas?.[base] || !desc) return false;
@@ -588,6 +645,20 @@ async function personasApi() {
         try {
             const m = await import(path);
             if (typeof m?.setUserAvatar === 'function') { personasModule = m; return m; }
+        } catch { /* следующий путь */ }
+    }
+    return null;
+}
+
+let groupsModule = null;
+/** Группы ST (openGroupById). В тестах подменяется. */
+export function _setGroupsApi(api) { groupsModule = api; }
+async function groupsApi() {
+    if (groupsModule) return groupsModule;
+    for (const path of ['../../../group-chats.js', '/scripts/group-chats.js']) {
+        try {
+            const m = await import(path);
+            if (typeof m?.openGroupById === 'function') { groupsModule = m; return m; }
         } catch { /* следующий путь */ }
     }
     return null;
@@ -661,12 +732,6 @@ export function legacyChronicleActive(book, eraId) {
         && (e.gc.replacedBy || []).includes('render:chronicle') && (!Array.isArray(e.gc.eras) || e.gc.eras.includes(String(eraId))));
 }
 
-/**
- * Хроника под дату — вместо ★ХРОНОЛОГИИ. Прошлое: события, отрезки и фиксированные точки до даты сюжета, только
- * видимые говорящему (дата, знание); состояние — только пока длится; далёкое — сводкой родителя (подсобытия
- * закрытых до эпохи отрезков не дублируем). Впереди: ближайшие фиксированные точки — режиссёрской пометкой «не
- * ломать», персонажи о них не знают.
- */
 /** Сыграно ли событие: gc.played (true или дата сцены) или пришло из чата (src.chat / src.stmb). */
 const playedEvent = (g) => !!g?.played || (typeof g?.src === 'object' && !!(g.src?.chat || g.src?.stmb));
 /** Событие своей эпохи позже её начала (или крупнее: год, с которого она начинается) и ещё не сыгранное. */
@@ -677,6 +742,24 @@ export function heldInEra(g, eraFrom) {
     return f > from || (f !== from && from.startsWith(f));
 }
 
+/**
+ * Фиксированная точка этого самого месяца (года): дата сюжета внутри него, а дня у точки нет — случилась ли она уже,
+ * по дате не понять. Пока она не отмечена сыгранной (gc.played), она «впереди» — режиссёру, а не в «что было»: финал
+ * эпохи не должен оказаться прошлым раньше, чем его сыграли. Завязка эпохи (дата ровно в её начало) уже была.
+ */
+export function pendingFixed(g, at, eraFrom) {
+    if (!g || g.kind !== 'fixed' || playedEvent(g) || !at || !g.from) return false;
+    const f = String(g.from);
+    const from = String(eraFrom || '');
+    return String(at).startsWith(f) && (!from || f > from || (f !== from && from.startsWith(f)));
+}
+
+/**
+ * Хроника под дату — вместо ★ХРОНОЛОГИИ. Прошлое: события, отрезки и фиксированные точки до даты сюжета, только
+ * видимые говорящему (дата, знание); состояние — только пока длится; далёкое — сводкой родителя (подсобытия
+ * закрытых до эпохи отрезков не дублируем). Впереди: ближайшие фиксированные точки — режиссёрской пометкой «не
+ * ломать», персонажи о них не знают.
+ */
 export function chronicleBlock(book, scope, books, { world, eraFrom, ahead = 4, maxPast = 40 } = {}) {
     const at = scope?.date || scope?.eraFrom;
     const out = { text: '', past: 0, ahead: 0, held: 0 };
@@ -694,12 +777,12 @@ export function chronicleBlock(book, scope, books, { world, eraFrom, ahead = 4, 
     const memo = new Map();
     // кто что знает: мировые фиксированные точки и public — всем; личная история — участникам (who) и тем, кому
     // известно (knows); рассказчику — всё несекретное; подсобытия тайного отрезка — только если виден сам отрезок
-    const knowsAt = (g) => !!sp && Array.isArray(g?.knows?.[sp]) && g.knows[sp].some(s => s.mode === 'knows' && covers(s, at));
+    const knowsAt = (g) => !!sp && knowsOn(g?.knows?.[sp], at, scope?.edge);
     const visible = (e) => {
         const id = Number(e.uid);
         if (memo.has(id)) return memo.get(id);
         const g = e.gc;
-        const open = g.kind === 'fixed' || isPublic(g, at);
+        const open = g.kind === 'fixed' || isPublic(g, at, scope?.edge);
         // сыграно раньше расчётной даты — судим по дате сцены
         const gg = typeof g.played === 'string' && g.played ? { ...g, from: g.played } : g;
         let ok = judgeEntry({ ...e, gc: gg, world, disable: false }, scope, books) !== 'drop';
@@ -716,8 +799,9 @@ export function chronicleBlock(book, scope, books, { world, eraFrom, ahead = 4, 
     // дойти — сводка не должна обгонять чат. Дата ровно в начало эпохи — завязка, она уже была.
     const held = (g) => heldInEra(g, from);
     const when = (g) => (typeof g.played === 'string' && g.played ? g.played : String(g.from));
+    const pending = (g) => !scope?.over && pendingFixed(g, at, from);
     const seen = all.filter(e => when(e.gc) <= at
-        && !held(e.gc)
+        && !held(e.gc) && !pending(e.gc)
         && !(e.gc.kind === 'state' && e.gc.to && !(at < String(e.gc.to)))
         && visible(e));
     out.held = all.filter(e => held(e.gc) && String(e.gc.from) <= at && visible(e)).length;
@@ -727,7 +811,7 @@ export function chronicleBlock(book, scope, books, { world, eraFrom, ahead = 4, 
         return !(p && keep.has(p) && p.gc.to && String(p.gc.to) <= from);   // далёкий отрезок — одной строкой родителя
     }).sort((a, b) => when(a.gc).localeCompare(when(b.gc)));
     const tail = past.slice(-maxPast);
-    const next = all.filter(e => e.gc.kind === 'fixed' && String(e.gc.from) > at)
+    const next = all.filter(e => e.gc.kind === 'fixed' && (String(e.gc.from) > at || pending(e.gc)))
         .sort((a, b) => String(a.gc.from).localeCompare(String(b.gc.from))).slice(0, ahead);
     const parts = [];
     if (tail.length) parts.push(`[Хроника мира — что было до ${fmtDate(at)} и что из этого известно говорящему]\n` + tail.map(line).join('\n'));
@@ -754,7 +838,7 @@ export function fragmentsBlock(book, scope, { max = 5 } = {}) {
         .map(e => {
             const g = e.gc;
             const spans = g.knows?.[sp];
-            if (!Array.isArray(spans) || spans.some(s => s.mode === 'knows' && covers(s, at))) return null;
+            if (!Array.isArray(spans) || knowsOn(spans, at, scope?.edge)) return null;
             if (!spans.some(s => s.mode === 'fragments' && covers(s, at))) return null;
             const h = typeof g.hint === 'string' ? g.hint : (g.hint?.[sp] || g.hint?.['*']);
             return h && String(h).trim() ? { from: String(g.from || ''), text: String(h).trim() } : null;
@@ -771,12 +855,12 @@ export function fragmentsBlock(book, scope, { max = 5 } = {}) {
 }
 
 /** Кто из сцены на эту дату носит обрывки (для Стража): id → есть хоть один отрезок «fragments». */
-export function fragmentHolders(book, at, ids = []) {
+export function fragmentHolders(book, at, ids = [], edge = null) {
     if (!book?.entries || !at) return [];
     const has = id => Object.values(book.entries).some(e => {
         const spans = e?.gc?.knows?.[id];
         return Array.isArray(spans) && spans.some(s => s.mode === 'fragments' && covers(s, at))
-            && !spans.some(s => s.mode === 'knows' && covers(s, at));
+            && !knowsOn(spans, at, edge);
     });
     return [...new Set(ids.filter(Boolean))].filter(has);
 }
@@ -819,9 +903,10 @@ export function whoBlock(data, era, date, speaker, roster) {
     const at = date || era.from || null;
     const lines = whoLines(era, at, speaker);
     const gone = new Map();
+    const edge = edgeOf(era, at);
     for (const name of absentNames(roster)) {
         const id = findIdentity(data, name);
-        if (!id) continue;
+        if (!id || (at && presentAt(id, at, edge))) continue;   // закомментирован давно, а на эту дату уже есть
         const why = at ? goneReason(id, at) : 'нет в этом времени';
         if (!gone.has(why)) gone.set(why, []);
         if (!gone.get(why).includes(id.name)) gone.get(why).push(id.name);
@@ -854,6 +939,9 @@ async function resolve() {
         const sd = storyDate(md, c.chat);
         date = clampDate(sd.date, era);
         dateSource = sd.source;
+        // дата ушла за конец эпохи (трекер, метка «с этого места») — её финал уже сыгран: всё, что случается и
+        // узнаётся в последнем месяце, случилось и известно. Копия — запись Реестра не трогаем.
+        if (sd.date && era.to && date !== sd.date && String(sd.date) > String(era.to)) era = { ...era, over: true };
         if (!date && era.to) { date = era.from; dateSource = 'начало эпохи'; }
     }
     current = { chatId, era, explicit, date, dateSource, world, registry: current.registry };
@@ -1009,23 +1097,26 @@ export function canonBrief({ data, era, date, book, cast = [] }) {
     const lines = [`Канон (Священный таймлайн): эпоха «${era.label || era.id}», дата сюжета — ${fmtDate(at)}. Никто не знает будущего — того, что случится позже этой даты.`];
     const entries = Object.values(book?.entries || {}).filter(e => e?.gc && CHRON_KINDS.includes(e.gc.kind) && e.gc.from
         && (!e.gc.status || e.gc.status === 'canon'));
-    const ahead = entries.filter(e => e.gc.kind === 'fixed' && String(e.gc.from) > at)
+    const ahead = entries.filter(e => e.gc.kind === 'fixed' && (String(e.gc.from) > at || (!era.over && pendingFixed(e.gc, at, era.from))))
         .sort((a, b) => String(a.gc.from).localeCompare(String(b.gc.from))).slice(0, 4);
     if (ahead.length) lines.push(`Канон — впереди, ломать нельзя (в сцене о них не знают): ${ahead.map(e => cleanTitle(e.comment)).join('; ')}.`);
-    const gone = ids.filter(g => (g.slices || []).length && !presentAt(g, at)).map(g => `${g.name} — ${goneReason(g, at)}`);
+    const edge = edgeOf(era, at);
+    const gone = ids.filter(g => (g.slices || []).length && !presentAt(g, at, edge)).map(g => `${g.name} — ${goneReason(g, at)}`);
     if (gone.length) lines.push(`Канон — в этом времени нет (не могут быть в сцене): ${gone.slice(0, 10).join('; ')}.`);
     const who = [...new Set(cast.filter(Boolean))];
-    const frag = fragmentHolders(book, at, who);
+    const frag = fragmentHolders(book, at, who, edge);
     if (frag.length) lines.push(`Канон — обрывки памяти (только подтекст, без имён; узнавания быть не может): ${frag.map(nameOf).join(', ')}.`);
     if (who.length > 1) {
-        const knowsAt = (g, id) => (g.knows && typeof g.knows === 'object'
-            ? (g.knows[id] || []).some(s => s.mode === 'knows' && covers(s, at))
-            : (g.who || []).includes(id));
+        const knowsAt = (g, id) => (g.knows && typeof g.knows === 'object' ? knowsOn(g.knows[id], at, edge) : (g.who || []).includes(id));
+        // тайна, которую кто-то из сцены узнаёт ровно в финале эпохи: раскрыта она уже или нет, по дате не понять —
+        // Страж такую не сторожит (иначе после сыгранного раскрытия флажки сыпались бы на каждый пост)
+        const turning = (g) => !!edge && who.some(id => (g.knows?.[id] || []).some(s => s?.mode === 'knows' && String(s.from) === edge));
         const secrets = [];
         for (const e of entries) {
             const g = e.gc;
-            if (!g.secret || String(g.from) > at || isPublic(g, at) || heldInEra(g, era.from)) continue;
+            if (!g.secret || String(g.from) > at || isPublic(g, at, edge) || heldInEra(g, era.from)) continue;
             if (g.kind === 'state' && g.to && at > String(g.to) && !at.startsWith(String(g.to))) continue;
+            if (turning(g)) continue;
             const yes = who.filter(id => knowsAt(g, id));
             const no = who.filter(id => !yes.includes(id));
             // в сцене был, а не знает (обманутый участник) — проговориться тут проще всего, такие — первыми
@@ -1318,12 +1409,18 @@ export function chronographModel(data, book) {
             text: String(e.content || '').slice(0, 1200),
         }))
         .sort((a, b) => a.from.localeCompare(b.from) || a.uid - b.uid);
+    // размах ленты: из Реестра (world.span), иначе по данным — от самого раннего события или эпохи до года после
+    // самого позднего
+    const years = [...events.flatMap(e => [e.from, e.to]), ...eras.flatMap(e => [e.from, e.to])]
+        .map(d => Number(String(d || '').slice(0, 4))).filter(y => y > 0);
+    const span = Array.isArray(w?.span) && w.span.length === 2 ? w.span.map(String)
+        : years.length ? [String(Math.min(...years)), String(Math.max(...years) + 1)] : ['1900', '2100'];
     return { world: w ? { id: w.id, name: w.name || w.id } : null, defaultEra: w?.defaultEra ? String(w.defaultEra) : null,
-        span: ['1917', '2025'], eras, events };
+        span, eras, events };
 }
 
 /** Войти в эпоху: открыть её каноничный (или указанный) чат — группу или чат карточки из состава эпохи. */
-async function enterEra(eraId, chatId = null) {
+export async function enterEra(eraId, chatId = null) {
     const data = await loadRegistry();
     const era = data ? eraById(data, eraId) : null;
     if (!era) throw new Error('нет такой эпохи');
@@ -1331,16 +1428,35 @@ async function enterEra(eraId, chatId = null) {
     if (!chat) throw new Error('у эпохи ещё нет чата');
     const c = ctx();
     if (era.group) {
-        if (typeof c.openGroupChat !== 'function') throw new Error('в таверне нет openGroupChat');
-        await c.openGroupChat(era.group, chat);
+        const gid = String(era.group);
+        const group = (c.groups || []).find(g => String(g.id) === gid);
+        if (!group) throw new Error('группы этой эпохи нет в таверне');
+        if (!(group.chats || []).includes(chat)) throw new Error(`чат «${chat}» не из группы эпохи — открой его из списка чатов`);
+        if (String(c.groupId ?? '') !== gid) {
+            // openGroupChat из контекста группу не выбирает — только меняет чат уже открытой. Группу открывает сама
+            // таверна (как по тапу в списке): иначе чат загрузится «ничьим».
+            const api = await groupsApi();
+            if (typeof api?.openGroupById !== 'function') throw new Error('в таверне нет openGroupById');
+            await api.openGroupById(group.id);
+            if (String(ctx().groupId ?? '') !== gid) throw new Error('таверна занята (идёт ответ или сохранение) — попробуй ещё раз');
+        }
+        const now = ctx();
+        if (now.getCurrentChatId?.() !== chat) {
+            if (typeof now.openGroupChat !== 'function') throw new Error('в таверне нет openGroupChat');
+            await now.openGroupChat(group.id, chat);
+        }
         return true;
     }
     const cards = (era.cast || []).map(sid => sliceById(data, sid)?.slice?.card).filter(Boolean);
     const idx = (c.characters || []).findIndex(ch => cards.includes(ch?.avatar));
     if (idx < 0) throw new Error(`нет карточки эпохи: ${cards.join(', ') || '—'}`);
-    if (String(c.characterId) !== String(idx)) await c.selectCharacterById(idx);
-    if (typeof c.openCharacterChat !== 'function') throw new Error('в таверне нет openCharacterChat');
-    await c.openCharacterChat(chat);
+    // из группы — тоже выбрать карточку заново: номер последнего говорившего в группе может совпасть с нужным
+    if (c.groupId || String(c.characterId) !== String(idx)) await c.selectCharacterById(idx);
+    const now = ctx();
+    if (now.groupId || String(now.characterId) !== String(idx)) throw new Error('таверна занята (идёт ответ или сохранение) — попробуй ещё раз');
+    if (now.getCurrentChatId?.() === chat) return true;
+    if (typeof now.openCharacterChat !== 'function') throw new Error('в таверне нет openCharacterChat');
+    await now.openCharacterChat(chat);
     return true;
 }
 
@@ -1363,11 +1479,22 @@ export function sliceById(data, sliceId) {
     return null;
 }
 
-/** Обличье личности: по карточке, иначе по дате. */
-export function sliceOf(data, identityId, { avatar, date } = {}) {
+/**
+ * Обличье личности: по карточке, иначе по дате. edge — последний месяц эпохи (edgeOf): облик, который кончается ровно
+ * им, ещё длится (следующий начнётся уже в другой эпохе). Если дату не накрывает ничего, а какой-то облик кончается
+ * в этом самом месяце (годе) — он.
+ */
+export function sliceOf(data, identityId, { avatar, date, edge } = {}) {
     const g = records(data, 'identity').find(x => x.id === identityId);
     const slices = g?.slices || [];
-    return (avatar && slices.find(s => s.card === avatar)) || (date && slices.find(s => covers(s, date))) || null;
+    const byCard = avatar && slices.find(s => s.card === avatar);
+    if (byCard || !date) return byCard || null;
+    const at = String(date);
+    const began = s => s.from == null || String(s.from) <= at;
+    return (edge && slices.find(s => s.to != null && String(s.to) === String(edge) && began(s)))
+        || slices.find(s => covers(s, at))
+        || slices.find(s => s.to != null && at.startsWith(String(s.to)) && began(s))
+        || null;
 }
 
 const MUTE_MODES = ['off', 'quiet'];
@@ -1471,14 +1598,14 @@ const ABSENT_MARK = '← нет в эпохе (ядро)';
  * Список персонажей строками («Имя = …» или «Имя | …»): тех, кого на дату нет в мире (умер, пыль, лёд, не родился),
  * расширка видит закомментированными. Это только взгляд — сам список в настройках не меняется.
  */
-export function rosterView(text, data, date) {
+export function rosterView(text, data, date, edge = null) {
     if (typeof text !== 'string' || !data || !date) return text;
     return text.split('\n').map(line => {
         const t = line.trim();
         if (!t || t.startsWith('#')) return line;
         const name = t.split(/[=|]/)[0].trim();
         const id = name ? findIdentity(data, name) : null;
-        return id && !presentAt(id, date) ? `# ${t}   ${ABSENT_MARK}` : line;
+        return id && !presentAt(id, date, edge) ? `# ${t}   ${ABSENT_MARK}` : line;
     }).join('\n');
 }
 
@@ -1549,26 +1676,32 @@ export function buildContext(data, cur, c) {
     };
     const ch = c?.characters?.[c?.characterId];
     const speakerId = speakerOf(data, ch, c?.name2);
-    const sp = speakerId ? sliceOf(data, speakerId, { avatar: ch?.avatar, date: cur.date || era.from }) : null;
+    const at = cur.date || era.from;
+    const edge = edgeOf(era, at);
+    const sp = speakerId ? sliceOf(data, speakerId, { avatar: ch?.avatar, date: at, edge }) : null;
     const pr = sliceById(data, era.persona);
     // кто есть кто в этом чате по именам — для расширок, которые хранят данные по имени персонажа (шкаф, жизнь):
     // имя → личность, её облик на дату чата и card — карточка, которой человек представлен в этом чате (у одного
     // человека бывает несколько карточек с одним именем, по эпохам; расширкам, ищущим карточку по имени, — сюда).
-    // Несколько его карточек в одной группе (эпоха через годы) — облик по дате, card — карточка этого облика.
+    // Несколько его карточек в одной группе (эпоха через годы) — облик по дате, card — карточка этого облика; если у
+    // облика на дату карточки в группе нет (он из следующей эпохи) — последняя по времени из тех, что в группе.
     // Персона (name1) — облик эпохи.
     const people = {};
-    const at = cur.date || era.from;
     const here = new Map();
     const note = (name, avatar) => { if (name && avatar) here.set(name, [...(here.get(name) || []), avatar]); };
-    const group = c?.groupId ? (c.groups || []).find(g => g.id === c.groupId) : null;
+    const group = c?.groupId ? (c.groups || []).find(g => String(g.id) === String(c.groupId)) : null;
     for (const av of group?.members || []) note((c?.characters || []).find(x => x.avatar === av)?.name, av);
     if (!group && ch) note(ch.name, ch.avatar);
     for (const [name, avatars] of here) {
         const id = speakerOf(data, { avatar: avatars[0], name }, name);
         if (!id) continue;
-        const sl = avatars.length > 1
-            ? (sliceOf(data, id, { date: at }) || sliceOf(data, id, { avatar: avatars[0] }))
-            : sliceOf(data, id, { avatar: avatars[0], date: at });
+        let sl = sliceOf(data, id, avatars.length > 1 ? { date: at, edge } : { avatar: avatars[0], date: at, edge });
+        if (avatars.length > 1 && !avatars.includes(sl?.card)) {
+            const mine = avatars.map(av => sliceOf(data, id, { avatar: av })).filter(Boolean);
+            const began = mine.filter(x => x.from == null || String(x.from) <= String(at))
+                .sort((a, b) => String(b.from || '').localeCompare(String(a.from || '')));
+            sl = began[0] || mine[0] || sl;
+        }
         people[name] = { identity: id, slice: sl?.id || null, label: sl?.label || null,
             card: avatars.includes(sl?.card) ? sl.card : avatars[0] };
     }
@@ -1598,7 +1731,7 @@ let guardKeys = [];
 let closed = new Set();   // расширки, выключенные в эпохе (режим off) — для заслонок
 let gates = [];
 let views = [];          // списки персонажей в настройках расширок
-let viewState = { data: null, date: null, eraId: null };
+let viewState = { data: null, date: null, eraId: null, edge: null };
 
 /** Охрана промптов и заслонки: на всё из каталога (расширки заводят ключи по ходу — зовётся перед каждой генерацией). */
 function armGuard() {
@@ -1613,7 +1746,7 @@ function armGuard() {
                 const inEra = () => !!viewState.eraId && v.eras.includes(String(viewState.eraId));
                 guardSetting(obj, v.key, t => erasView(t, viewState.eraId, v.eras), (t, real) => (t === '' && !inEra() ? real : t));
             } else {
-                guardSetting(obj, v.key, t => rosterView(t, viewState.data, viewState.date), t => rosterUnview(t));
+                guardSetting(obj, v.key, t => rosterView(t, viewState.data, viewState.date, viewState.edge), t => rosterUnview(t));
             }
         }
     } catch (e) { console.warn(TAG, 'охрана расширок не встала', e); }
@@ -1654,7 +1787,8 @@ async function publish(data) {
     guardKeys = data ? catalogKeys(data) : [];
     gates = data ? catalogGates(data) : [];
     views = data ? catalogViews(data) : [];
-    viewState = { data, date: cx?.era ? (current.date || cx.era.from || null) : null, eraId: cx?.era?.id || null };
+    const viewDate = cx?.era ? (current.date || cx.era.from || null) : null;
+    viewState = { data, date: viewDate, eraId: cx?.era?.id || null, edge: edgeOf(current.era, viewDate) };
     armGuard();
     applyPolicyCss(data);
     applyBodyAttrs(cx);
@@ -1675,7 +1809,7 @@ async function publish(data) {
 // ───────────── Закулисье ─────────────
 
 /** Закомментировать в ростере Закулисья тех, кого нет на дату. Уже убранные раньше (skip) не трогаем. */
-export function pruneRoster(text, data, date, skip = [], label = '') {
+export function pruneRoster(text, data, date, skip = [], label = '', edge = null) {
     const removed = [];
     const out = String(text || '').split('\n').map(line => {
         const t = line.trim();
@@ -1683,19 +1817,54 @@ export function pruneRoster(text, data, date, skip = [], label = '') {
         const name = t.split('|')[0].trim();
         if (!name || skip.includes(name)) return line;
         const id = findIdentity(data, name);
-        if (!id || presentAt(id, date)) return line;
+        if (!id || presentAt(id, date, edge)) return line;
         removed.push({ name, id });
         return `# ${t}   ← нет в эпохе ${label || date} (по Реестру)`;
     });
     return { text: out.join('\n'), removed };
 }
 
+const PRUNED_RE = /^#\s*(.*?)\s+← нет в эпохе [^\n]*\(по Реестру\)\s*$/;
+
+/**
+ * Вернуть в ростер тех, кого ядро закомментировало раньше, а на эту дату они в мире есть (родился, вернулся, сюжет
+ * дошёл до его появления). Строки, закомментированные руками, не трогает. Возвращает текст и имена вернувшихся.
+ */
+export function restoreRoster(text, data, date, edge = null) {
+    const restored = [];
+    const out = String(text || '').split('\n').map(line => {
+        const m = line.trim().match(PRUNED_RE);
+        if (!m) return line;
+        const name = m[1].split('|')[0].trim();
+        const id = name ? findIdentity(data, name) : null;
+        if (!id || !date || !presentAt(id, date, edge)) return line;
+        restored.push(name);
+        return m[1];
+    });
+    return { text: out.join('\n'), restored };
+}
+
 async function guardBackstage(data, era, date, md) {
     const bs = md?.backstage;
     if (!bs || typeof bs.roster !== 'string') return [];
-    const done = Array.isArray(md[MODULE]?.backstagePruned) ? md[MODULE].backstagePruned : [];
-    const { text, removed } = pruneRoster(bs.roster, data, date || eraDate(era), done, era.id);
-    if (!removed.length) return [];
+    let done = Array.isArray(md[MODULE]?.backstagePruned) ? md[MODULE].backstagePruned : [];
+    const at = date || eraDate(era);
+    const edge = edgeOf(era, at);
+    // сюжет дошёл до того, кого раньше «не было» (родился, вернулся) — строка возвращается в состав
+    const back = restoreRoster(bs.roster, data, at, edge);
+    if (back.restored.length) {
+        bs.roster = back.text;
+        done = done.filter(n => !back.restored.includes(n));
+        md[MODULE] = { ...(md[MODULE] || {}), backstagePruned: done };
+    }
+    const { text, removed } = pruneRoster(bs.roster, data, at, done, era.id, edge);
+    if (!removed.length) {
+        if (back.restored.length) {
+            await ctx().saveMetadata();
+            console.log(TAG, `Эпоха ${era.id}: вернула в Закулисье — ${back.restored.join(', ')}`);
+        }
+        return [];
+    }
 
     bs.roster = text;
     if (bs.agendas && typeof bs.agendas === 'object') {
@@ -1879,7 +2048,7 @@ function statusLines() {
     }
     const how = current.explicit ? '' : ' (по умолчанию — чат в Реестре не отмечен)';
     out.push(`Эпоха: <b>${esc(current.era.id)}</b> — ${esc(current.era.label || '')}${how}`);
-    out.push(current.date ? `Дата сюжета: ${esc(fmtDate(current.date))}${current.dateSource ? ` (${esc(current.dateSource)})` : ''}` : 'Дата сюжета: не видна — лорбуки по датам не режу.');
+    out.push(current.date ? `Дата сюжета: ${esc(fmtDate(current.date))}${current.dateSource ? ` (${esc(current.dateSource)})` : ''}${current.era.over ? ' — за концом эпохи: её финал считаю сыгранным' : edgeOf(current.era, current.date) ? ' — финал эпохи: что случается и узнаётся в этом месяце, ещё впереди' : ''}` : 'Дата сюжета: не видна — лорбуки по датам не режу.');
     const pruned = ctx().chatMetadata?.[MODULE]?.backstagePruned;
     if (Array.isArray(pruned) && pruned.length) out.push(`Закулисье: убраны ${esc(pruned.join(', '))}`);
     if (lastBooks && (lastBooks.added.length || lastBooks.missing.length)) {
@@ -1944,6 +2113,10 @@ function renderSettings() {
             <span>Хронист — память канон-чата эпохи → подзаписи Хроники 🟡</span></label>
           <label class="sacred-timeline-row"><span>Ревизор — профиль:</span>
             <select id="sacred_timeline_reviser" class="text_pole"></select></label>
+          <div class="sacred-timeline-row sacred-timeline-date"><span>Дата сюжета:</span>
+            <input id="sacred_timeline_date" class="text_pole" type="text" placeholder="1961-03-15 — с этого места">
+            <div class="menu_button" id="sacred_timeline_date_set">Поставить</div>
+            <div class="menu_button" id="sacred_timeline_date_clear" title="Снять метку — дату снова ведут трекер и Horae">✕</div></div>
           <div id="sacred_timeline_canon"></div>
           <div class="menu_button" id="sacred_timeline_check">Проверить этот чат</div>
           <small>v${VERSION} · /era — эпоха чата</small>
@@ -1966,6 +2139,11 @@ function renderSettings() {
         renderStatus();
     });
     $('#sacred_timeline_check').on('click', () => { onChatChanged({ reset: false }).catch(e => console.warn(TAG, e)); });
+    const mark = (value) => markDate(value)
+        .then(text => { try { window.toastr?.info(text, 'Священный таймлайн'); } catch { /* ignore */ } })
+        .catch(e => console.warn(TAG, 'метка даты', e));
+    $('#sacred_timeline_date_set').on('click', () => { const v = String($('#sacred_timeline_date').val() || '').trim(); if (v) mark(v); });
+    $('#sacred_timeline_date_clear').on('click', () => mark('off'));
     $('#sacred_timeline_strazh').on('change', function () { settings().strazh = this.checked; ctx().saveSettingsDebounced(); refreshCanon(); });
     $('#sacred_timeline_chronist').on('change', function () { settings().chronist = this.checked; ctx().saveSettingsDebounced(); });
     const fillProfiles = () => {
@@ -1978,6 +2156,21 @@ function renderSettings() {
     $('#sacred_timeline_reviser').on('focus', fillProfiles).on('change', function () { settings().reviser = this.value; ctx().saveSettingsDebounced(); });
     renderStatus();
     renderCanon();
+}
+
+/** Метка даты сюжета на этот чат — из настроек и по /era date=…; дальше всё пересчитывается как при входе в чат. */
+async function markDate(value) {
+    const c = ctx();
+    if (!c.getCurrentChatId?.() || !c.chatMetadata) return 'Чат не открыт.';
+    const d = setDateMark(c.chatMetadata, value, (c.chat || []).length);
+    if (d === null) return `Не поняла дату «${String(value).trim()}» — напиши как 1961-03-15, 15.03.1961 или «март 1961».`;
+    await c.saveMetadata?.();
+    await onChatChanged({ reset: false });
+    if (typeof $ === 'function') $('#sacred_timeline_date').val('');
+    if (!d) return `Метка даты снята. ${eraReport()}`;
+    const off = current.era && current.date && current.date !== d
+        ? ` Дата вне эпохи ${current.era.id} — взяла ${fmtDate(current.date)}${current.era.over ? '; финал эпохи считаю сыгранным' : ''}.` : '';
+    return `Дата сюжета с этого места — ${fmtDate(d)}.${off}`;
 }
 
 function eraReport() {
@@ -2118,11 +2311,16 @@ async function processDrafts(uids) {
                 if (typeof life?.askModel === 'function' && !e.gc.chronist) {
                     try { applyChronist(e, await life.askModel(chronistPrompt(e, data, era), 900)); wrote++; } catch (x) { console.warn(TAG, 'Хронист', x); }
                 }
+                let touched = !!e.gc.chronist;
                 if (reviserProfile()) {
-                    const v = applyReview(e, await askReviser(reviserPrompt(e, chron, era, sourcePosts(e))));
-                    if (v === 'ok') ok++; else nexus++;
+                    // Ревизор не ответил (сеть, не по форме) — подзапись Хрониста всё равно сохраняем, она ждёт 🟡
+                    try {
+                        const v = applyReview(e, await askReviser(reviserPrompt(e, chron, era, sourcePosts(e))));
+                        if (v === 'ok') ok++; else nexus++;
+                        touched = true;
+                    } catch (x) { console.warn(TAG, 'Ревизор', x); }
                 }
-                return true;
+                return touched;
             });
         } catch (x) {
             console.warn(TAG, 'подзапись', uid, x);
@@ -2322,11 +2520,25 @@ function bindCanonUi() {
 
 function registerSlash() {
     try {
-        const { SlashCommandParser, SlashCommand } = ctx();
+        const { SlashCommandParser, SlashCommand, SlashCommandNamedArgument, ARGUMENT_TYPE } = ctx();
+        const named = SlashCommandNamedArgument?.fromProps && ARGUMENT_TYPE
+            ? [SlashCommandNamedArgument.fromProps({ name: 'date', description: 'дата сюжета с этого места: 1961-03-15, «март 1961»; off — снять', typeList: [ARGUMENT_TYPE.STRING] })]
+            : [];
         SlashCommandParser.addCommandObject(SlashCommand.fromProps({
             name: 'era',
-            helpString: 'Священный таймлайн: какая эпоха и дата у этого чата.',
-            callback: async () => {
+            helpString: 'Священный таймлайн: какая эпоха и дата у этого чата. <code>/era date=1961-03-15</code> — поставить дату сюжета с этого места (дальше её снова ведут трекер и Horae), <code>/era date=off</code> — снять метку.',
+            namedArgumentList: named,
+            callback: async (args, value) => {
+                // /era date=1961-03, /era дата 1961-03 или просто /era 1961-03
+                const text0 = String(value ?? '').trim();
+                const typed = text0.match(/^(?:date|дата)\s*=?\s*(.+)$/i)?.[1]
+                    ?? (/^\d{4}(-\d{2}){0,2}$/.test(text0) || parseStoryDate(text0) ? text0 : undefined);
+                const raw = args?.date ?? typed;
+                if (raw !== undefined && raw !== null && String(raw).trim()) {
+                    const text = await markDate(raw);
+                    try { window.toastr?.info(text, 'Священный таймлайн'); } catch { /* ignore */ }
+                    return text;
+                }
                 await resolve();
                 const text = eraReport();
                 try { window.toastr?.info(text, 'Священный таймлайн'); } catch { /* ignore */ }
@@ -2399,13 +2611,14 @@ if (typeof jQuery === 'function') {
                 const data = await loadRegistry();
                 const id = data ? speakerOf(data, { avatar, name }, name) || findIdentity(data, name)?.id : null;
                 if (!id) return null;
-                const sl = sliceOf(data, id, { avatar, date });
+                const sl = sliceOf(data, id, { avatar, date, edge: edgeOf(current.era, date) });
                 return { identity: id, slice: sl?.id || null, label: sl?.label || null };
             },
             present: async (name, date) => {
                 const data = await loadRegistry();
                 const id = data && findIdentity(data, name);
-                return id ? presentAt(id, date || current.date) : null;
+                const at = date || current.date;
+                return id ? presentAt(id, at, edgeOf(current.era, at)) : null;
             },
         };
         if (ctx().getCurrentChatId?.()) onChatChanged().catch(e => console.warn(TAG, e));
