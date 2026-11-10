@@ -19,6 +19,9 @@
 # (подтянуть, если стоит), «+ ссылка» (ещё и поставить, если нет), «- папка» (убрать в бэкап). Только свои репы
 # (github.com/clarawill137), только fast-forward; папку с твоими правками не трогает. Чужие пропатченные
 # расширки мост не обновляет никогда.
+# Свои расширки без репы: строка «= папка» в extensions.txt — файлы папки extensions/<папка> (верхний уровень) ходят
+# через эту же репу, как лорбуки: снимок с сервера → правки Claude → на сервер. Только код и тексты (js, css, json,
+# html, md…), без бэкапов и файлов с «secret/token» в имени. Папку-клон git так не берёт.
 
 set -Eeuo pipefail
 trap 'printf "❌ Сбой в строке %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
@@ -201,21 +204,26 @@ drop_unsent_merge() {
 
 # Сторож откатов. После применения правок Claude страницу ST надо обновить: иначе таверна (или расширка) при первом же
 # сохранении лорбука запишет свою старую копию поверх — и правки Claude молча пропадут. Здесь это видно: в свежем
-# снимке ($1 — что было до него) запись лорбука (или целый файл) вернулась к тому, что было ДО последнего применения.
-# Ничего не чинит — говорит вслух и оставляет пометку в истории репы (её увидит Claude).
-check_reverts() {
-  local before=${1:-} last pre snap out
+# снимке ($1 — что было до него) запись лорбука (или целый файл) стояла как у Claude и вернулась к тому, что было ДО
+# одного из последних применений. Такое возвращаю сам: в зеркале — коммитом «вернуть откатившиеся правки Claude» поверх
+# снимка (записи — по одной, остальное в файле как на сервере: свежая память STMB и свои правки целы), на сервер — вместе
+# с остальными правками, после того же вопроса. REVERT_NOTE — что откатилось (для пометки в истории, если не вернули).
+RESTORE_MSG="вернуть откатившиеся правки Claude"
+REVERT_NOTE=""
+restore_reverts() {
+  local before=${1:-} snap out
+  REVERT_NOTE=""
   command -v python3 >/dev/null || return 0
   [[ -n $before ]] || return 0
   snap=$(g rev-parse -q --verify HEAD) || return 0
   [[ $snap != "$before" ]] || return 0
-  last=$(g log --first-parent -1 --format=%H --grep='^применить правки Claude$' "$before" 2>/dev/null || true)
-  [[ -n $last ]] || return 0
-  pre=$(g rev-parse -q --verify "$last^1" 2>/dev/null) || return 0
-  out=$(python3 - "$MIRROR" "$pre" "$last" "$before" "$snap" "${DIRS[@]}" <<'PYEOF' 2>/dev/null || true
-import json, subprocess, sys
-mirror, pre, last, before, snap = sys.argv[1:6]
-dirs = sys.argv[6:]
+  local -a merges=()
+  mapfile -t merges < <(g log --first-parent -5 --format=%H --grep='^применить правки Claude$' "$before" 2>/dev/null || true)
+  (( ${#merges[@]} )) || return 0
+  out=$(python3 - "$MIRROR" "$before" "$snap" "${#merges[@]}" "${merges[@]}" "${DIRS[@]}" <<'PYEOF' 2>/dev/null || true
+import json, os, re, subprocess, sys
+mirror, before, snap, n = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+merges, dirs = sys.argv[5:5 + n], sys.argv[5 + n:]
 
 def git(*a):
     return subprocess.run(['git', '-C', mirror, *a], capture_output=True)
@@ -228,51 +236,108 @@ def blob(rev, path):
     r = git('rev-parse', '-q', '--verify', f'{rev}:{path}')
     return r.stdout.decode().strip() if r.returncode == 0 else None
 
-def entries(rev, path):
+def show(rev, path):
     r = git('show', f'{rev}:{path}')
-    if r.returncode:
+    return r.stdout if r.returncode == 0 else None
+
+def entries(rev, path):
+    raw = show(rev, path)
+    if raw is None:
         return None
     try:
-        e = json.loads(r.stdout.decode('utf-8')).get('entries')
+        e = json.loads(raw.decode('utf-8')).get('entries')
         return e if isinstance(e, dict) else {}
     except Exception:
         return None
 
-for path in sorted(names(pre, last) & names(before, snap)):
-    # файл целиком вернулся к тому, что было до применения
-    if blob(before, path) == blob(last, path) and blob(snap, path) == blob(pre, path):
-        print(f'{path}\tцеликом')
+changed = names(before, snap)
+whole = {}     # путь → ревизия, из которой вернуть файл целиком
+fix = {}       # путь → {'set': {ключ: запись}, 'del': {ключи}, 'order': порядок ключей у Claude}
+for last in merges:
+    pre = f'{last}^1'
+    for path in sorted(names(pre, last) & changed):
+        if path in whole:
+            continue
+        # файл стоял как после применения — и целиком вернулся к тому, что было до него
+        if blob(before, path) == blob(last, path) and blob(snap, path) == blob(pre, path):
+            whole[path] = last
+            fix.pop(path, None)
+            continue
+        if not (path.startswith('worlds/') and path.endswith('.json')):
+            continue
+        a, b, c, d = (entries(r, path) for r in (pre, last, before, snap))
+        if b is None or d is None:
+            continue
+        a, c = a or {}, c or {}
+        f = fix.setdefault(path, {'set': {}, 'del': set(), 'order': list(b)})
+        for k, v in b.items():
+            # запись, которую менял (или добавил) Claude, стояла как у него — и вернулась к старой (или пропала)
+            if a.get(k) != v and c.get(k) == v and d.get(k) == a.get(k) and k not in f['set']:
+                f['set'][k] = v
+        for k, v in a.items():
+            # запись, которую Claude убрал, вернулась
+            if k not in b and k not in c and d.get(k) == v:
+                f['del'].add(k)
+
+for path, rev in sorted(whole.items()):
+    full = os.path.join(mirror, path)
+    raw = show(rev, path)
+    if raw is None:
+        if os.path.exists(full):
+            os.remove(full)
+    else:
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        open(full, 'wb').write(raw)
+    print(f'{path}\tцеликом')
+
+for path, f in sorted(fix.items()):
+    count = len(f['set']) + len(f['del'])
+    if not count:
         continue
-    if not (path.startswith('worlds/') and path.endswith('.json')):
-        continue
-    a, b, c, d = (entries(r, path) for r in (pre, last, before, snap))
-    if b is None or d is None:
-        continue
-    a, c = a or {}, c or {}
-    n = 0
-    for k, v in b.items():
-        # запись, которую менял (или добавил) Claude, стояла как у него — и вернулась к старой (или пропала)
-        if a.get(k) != v and c.get(k) == v and d.get(k) == a.get(k):
-            n += 1
-    for k, v in a.items():
-        # запись, которую Claude убрал, вернулась
-        if k not in b and k not in c and d.get(k) == v:
-            n += 1
-    if n:
-        print(f'{path}\tзаписей: {n}')
+    text = show(snap, path).decode('utf-8')
+    obj = json.loads(text)
+    ent = obj.get('entries') or {}
+    keys = [k for k in ent if k not in f['del']]
+    for k in f['set']:
+        if k in keys:
+            continue
+        # пропавшая запись встаёт туда же, где стояла у Claude: после ближайшей соседки сверху
+        order = f['order']
+        at = 0
+        for prev in reversed(order[:order.index(k)] if k in order else []):
+            if prev in keys:
+                at = keys.index(prev) + 1
+                break
+        keys.insert(at, k)
+    obj['entries'] = {k: (f['set'][k] if k in f['set'] else ent[k]) for k in keys}
+    m = re.search(r'\n([ \t]+)"', text)
+    out = json.dumps(obj, ensure_ascii=False, indent=m.group(1)) if m else json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+    open(os.path.join(mirror, path), 'w', encoding='utf-8', newline='').write(out + ('\n' if text.endswith('\n') else ''))
+    print(f'{path}\tзаписей: {count}')
 PYEOF
   )
-  [[ -n $out ]] || return 0
+  if [[ -z $out ]]; then g reset -q --hard "$snap" 2>/dev/null || true; return 0; fi
   warn "На сервере откатились правки Claude (похоже, страницу ST не обновили после прошлого применения):"
-  local line n note=""
+  local line n
   while IFS=$'\t' read -r line n; do
     [[ -n $line ]] || continue
     printf '   %s — %s\n' "$line" "$n" >&2
-    note+="${line##*/} — $n; "
+    REVERT_NOTE+="${line##*/} — $n; "
   done <<<"$out"
-  say "   Скажи Claude: «откат» — он вернёт. Перед этим обнови страницу ST."
-  g commit -q --allow-empty -m "⚠ сервер: откатились правки Claude — ${note%; }" 2>/dev/null || true
+  REVERT_NOTE=${REVERT_NOTE%; }
+  g add -A -- "${DIRS[@]}"
+  if g diff --cached --quiet; then note_reverts; return 0; fi
+  g commit -q -m "$RESTORE_MSG — $REVERT_NOTE"
+  say "   Верну их на сервер — остальное в этих файлах (свежая память, твои правки) не трону."
   return 0
+}
+
+# не вернули (отказ, сбой) — пометка в истории репы: её увидит Claude
+note_reverts() {
+  [[ -n $REVERT_NOTE ]] || return 0
+  g commit -q --allow-empty -m "⚠ сервер: откатились правки Claude — $REVERT_NOTE" 2>/dev/null || true
+  say "   Откат остался. Скажи Claude: «откат» — он вернёт. Перед этим обнови страницу ST."
+  REVERT_NOTE=""
 }
 
 lock() {
@@ -388,6 +453,7 @@ ext_sync() {
   while IFS= read -r line; do
     line=${line%%#*}; read -r a b _ <<<"$line" || true
     [[ -n ${a:-} ]] || continue
+    [[ $a == "=" ]] && continue   # своя расширка без репы — её файлы ходят вместе с данными (load_local_exts)
     local act=pull
     if [[ $a == + ]]; then act=install; a=${b:-}; b=""; fi
     if [[ $a == - ]]; then
@@ -431,6 +497,33 @@ cmd_ext() {
   EXT_FROM_ORIGIN=1 ext_sync
 }
 
+# Свои расширки без репы («= папка» в списке): добавляю их папки к тому, что синкается. Список — из свежей репы:
+# так просьба Claude срабатывает в тот же запуск. Папку с .git (клон) не беру — её обновляют по ссылке. Папки на
+# сервере нет, а в зеркале её файлы есть — не трогаю ничего (иначе снимок записал бы «всё удалено»).
+LOCAL_EXTS_LOADED=""
+load_local_exts() {
+  [[ -z $LOCAL_EXTS_LOADED ]] || return 0
+  LOCAL_EXTS_LOADED=1
+  local list line a b dir
+  list=$(g show "origin/$BRANCH:$EXT_LIST" 2>/dev/null || g show "HEAD:$EXT_LIST" 2>/dev/null || true)
+  [[ -n $list ]] || return 0
+  while IFS= read -r line; do
+    line=${line%%#*}; a=""; b=""; read -r a b _ <<<"$line" || true
+    [[ ${a:-} == "=" ]] || continue
+    if [[ ! ${b:-} =~ ^[A-Za-z0-9._-]+$ || $b == . || $b == .. ]]; then warn "Расширки: странное имя папки «${b:-}» — пропускаю."; continue; fi
+    dir="extensions/$b"
+    if [[ " ${DIRS[*]} " == *" $dir "* ]]; then continue; fi
+    if [[ $(ct_sh '[ -d "$1/.git" ] && echo git || true' "$dir" 2>/dev/null) == git ]]; then
+      warn "Расширки: $dir — клон git, её обновляют по ссылке; строку «= $b» пропускаю."; continue
+    fi
+    if [[ -z $(ct_list "$dir" | tr -d '\0') && -n $(g ls-files -- "$dir" 2>/dev/null) ]]; then
+      warn "Расширки: на сервере нет файлов в $dir, а в репе они есть — не трогаю. Вернуть — скажи Claude; не нужна — пусть уберёт строку «= $b»."; continue
+    fi
+    SPECS+=("$dir|*"); DIRS+=("$dir")
+  done <<<"$list"
+  return 0
+}
+
 # ---------- снимок сервера ----------
 
 snapshot() { # $1 — текст коммита
@@ -443,6 +536,11 @@ snapshot() { # $1 — текст коммита
     mkdir -p "$TMPD/new/$dir"
     ct_list "$dir" > "$TMPD/list"
     while IFS= read -r -d '' name; do
+      # в папке расширки — только код и тексты: без скрытых файлов, бэкапов, картинок и всего, что похоже на ключи
+      if [[ $dir == extensions/* ]]; then
+        [[ $name =~ \.(js|mjs|cjs|css|html|json|md|txt|svg)$ ]] || continue
+        if [[ $name == .* || $name == *.bak* || ${name,,} == *secret* || ${name,,} == *token* || ${name,,} == *credential* ]]; then continue; fi
+      fi
       # shellcheck disable=SC2053
       if [[ $name == $glob ]]; then rels+=("$dir/$name"); fi
     done < "$TMPD/list"
@@ -701,6 +799,7 @@ apply_changes() {
     if [[ ${CH_ST[i]} == D ]]; then
       ct_rm "$rel"
     else
+      if [[ $rel == extensions/* ]]; then ct_mkdir "$(dirname -- "$rel")"; ct_chown "$owner" "$(dirname -- "$rel")"; fi
       ct_put "$MIRROR/$rel" "$rel"
       ct_chown "$owner" "$rel"
     fi
@@ -738,6 +837,12 @@ after_apply_hint() {
     fi
   done
   for p in "${CH_PATH[@]}"; do
+    if [[ $p == extensions/* ]]; then
+      say "   Менялись файлы расширки — она подхватится после обновления страницы."
+      break
+    fi
+  done
+  for p in "${CH_PATH[@]}"; do
     if [[ $p == characters/* || $p == "User Avatars/"* ]]; then
       say "   Менялись картинки — их миниатюры я снесла, ST соберёт свежие. Если Safari упрямится — обнови страницу ещё раз."
       break
@@ -761,11 +866,13 @@ cmd_sync_data() {
   say "⏳ Снимаю сервер…"
   g fetch -q origin 2>/dev/null || die "Нет связи с GitHub. Запусти: st-sync setup"
   drop_unsent_merge
+  load_local_exts
   local before; before=$(g rev-parse -q --verify HEAD 2>/dev/null || true)
   snapshot "сервер: снимок $(date '+%Y-%m-%d %H:%M')"
   g rev-parse -q --verify HEAD >/dev/null || die "На сервере не нашлось ни лорбуков, ни пресетов — проверь контейнер $CT."
-  check_reverts "$before"
+  # snap — сервер как есть; возврат откатившегося ложится коммитом поверх и едет на сервер как обычная правка
   local snap; snap=$(g rev-parse HEAD)
+  restore_reverts "$before"
 
   if ! has_origin_main; then
     push_main; g branch -q -u "origin/$BRANCH" 2>/dev/null || true
@@ -774,6 +881,22 @@ cmd_sync_data() {
   fi
 
   if g merge-base --is-ancestor "origin/$BRANCH" HEAD; then
+    if [[ $(g rev-parse HEAD) != "$snap" ]]; then
+      # новых правок нет, но есть что вернуть
+      collect_changes "$snap" HEAD
+      say "↩️  Возвращаю откатившееся:"
+      show_changes
+      if validate_changes && confirm "Вернуть на сервер?"; then
+        apply_changes
+        REVERT_NOTE=""
+        push_main
+        after_apply_hint
+      else
+        g reset -q --hard "$snap"; note_reverts
+        push_main
+      fi
+      return 0
+    fi
     push_main
     say "✅ Снимок отправлен. Новых правок от Claude нет."
     return 0
@@ -783,7 +906,8 @@ cmd_sync_data() {
   if ! mout=$(g merge -q --no-ff --no-edit --allow-unrelated-histories -m "применить правки Claude" "origin/$BRANCH" 2>&1); then
     local conflicted
     conflicted=$(g diff --name-only --diff-filter=U 2>/dev/null || true)
-    g merge --abort 2>/dev/null || g reset -q --hard "$snap"
+    g merge --abort 2>/dev/null || true
+    g reset -q --hard "$snap"; note_reverts
     push_server_branch
     if [[ -n $conflicted ]]; then
       say "⚠️  Правки Claude конфликтуют с тем, что изменилось на сервере:"
@@ -804,15 +928,15 @@ cmd_sync_data() {
     return 0
   fi
 
-  say "📦 Правки от Claude:"
+  if [[ -n $REVERT_NOTE ]]; then say "📦 Правки от Claude (и то, что откатилось, — верну заодно):"; else say "📦 Правки от Claude:"; fi
   show_changes
   show_out
   if ! validate_changes || ! validate_out; then
-    g reset -q --hard "$snap"; push_server_branch
+    g reset -q --hard "$snap"; note_reverts; push_server_branch
     die "Что-то из правок применить нельзя (см. выше) — ничего не применено. Напиши Claude."
   fi
   if ! confirm "Применить на сервер?"; then
-    g reset -q --hard "$snap"; push_server_branch
+    g reset -q --hard "$snap"; note_reverts; push_server_branch
     say "Ок, не применяю. Правки ждут в репе."
     return 0
   fi
@@ -820,6 +944,7 @@ cmd_sync_data() {
   printf '%s\n' "$merge" > "$MIRROR/.git/st-sync-last"
   if (( ${#CH_PATH[@]} )); then apply_changes; fi
   if (( ${#CO_PATH[@]} )); then apply_out; fi
+  REVERT_NOTE=""
   push_main
   after_apply_hint
   if (( ${#CO_PATH[@]} )); then
@@ -836,6 +961,7 @@ cmd_undo() {
   local merge; merge=$(<"$MIRROR/.git/st-sync-last")
   g cat-file -e "$merge^{commit}" 2>/dev/null || die "Не нашла последнее применение."
   g fetch -q origin 2>/dev/null || warn "Нет связи с GitHub — откат сделаю, отправлю позже."
+  load_local_exts
   say "⏳ Снимаю сервер перед откатом…"
   snapshot "сервер: снимок перед откатом $(date '+%Y-%m-%d %H:%M')"
   local before; before=$(g rev-parse HEAD)
@@ -935,6 +1061,6 @@ case "${1:-sync}" in
   setup)   cmd_setup ;;
   update)  cmd_update ;;
   ext)     cmd_ext ;;
-  help|-h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' ;;
+  help|-h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "Не знаю команду «$1». Есть: st-sync, st-sync ext, st-sync undo, st-sync status, st-sync update, st-sync setup" ;;
 esac

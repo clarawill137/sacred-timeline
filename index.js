@@ -15,7 +15,7 @@
 // Лора в коде нет — он весь в Реестре и Хронике.
 
 const MODULE = 'sacred_timeline';
-const VERSION = '0.9.8';
+const VERSION = '0.9.9';
 const TAG = '[Священный таймлайн]';
 const DEFAULTS = { filterLore: true, persona: true, who: true, chronicle: true, strazh: true, chronist: true, reviser: '' };
 const WHO_KEY = 'sacred_timeline_who';
@@ -38,6 +38,8 @@ let lastHistory = null;  // память прошлых эпох в промпт
 let lastChron = null;    // Хроника под дату: { past, ahead } — сколько строк ушло
 let lastCanon = null;    // строки «Канон» для Стража (Летописец Life): { input, chatId }
 let lastDrafts = [];     // подзаписи Хроники этой эпохи на проверке: [{ uid, title, status, who, review }]
+let lastWaiting = [];    // что в этой эпохе ждёт сцены на дату: [{ uid, kind, from, title, final, done }]
+const justPlayed = new Map();   // отмеченные сыгранными в этом чате — остаются в списке, пока чат открыт: можно снять
 let switchingPersona = false;
 
 function settings() {
@@ -734,6 +736,29 @@ export function legacyChronicleActive(book, eraId) {
 
 /** Сыграно ли событие: gc.played (true или дата сцены) или пришло из чата (src.chat / src.stmb). */
 const playedEvent = (g) => !!g?.played || (typeof g?.src === 'object' && !!(g.src?.chat || g.src?.stmb));
+/** Когда событие случилось для сюжета: дата сцены (gc.played — дата), иначе расчётная (gc.from). */
+const whenOf = (g) => (typeof g?.played === 'string' && g.played ? g.played : String(g?.from ?? ''));
+/** Канон Хроники: без статуса или status «canon». */
+const isCanon = (g) => !!g && (!g.status || g.status === 'canon');
+
+/**
+ * Отметить событие сыгранным или снять отметку. value: true — сыграно; дата («1961-03-15», «март 1961») — сыграно
+ * этой датой сюжета (дальше событие судится по ней, а не по расчётной); false / пусто — снять. Только события и
+ * фиксированные точки. Возвращает новое значение gc.played (true | дата | null) или undefined — не то или не понял.
+ */
+export function setPlayed(entry, value) {
+    const g = entry?.gc;
+    if (!g || !['fixed', 'event'].includes(g.kind)) return undefined;
+    if (value === false || value == null || value === '') {
+        delete g.played;
+        return null;
+    }
+    if (value === true) return (g.played = true);
+    const raw = String(value).trim();
+    const date = /^\d{4}(-\d{2}){0,2}$/.test(raw) ? raw : parseStoryDate(raw);
+    if (!date) return undefined;
+    return (g.played = date);
+}
 /** Событие своей эпохи позже её начала (или крупнее: год, с которого она начинается) и ещё не сыгранное. */
 export function heldInEra(g, eraFrom) {
     if (!g || g.kind !== 'event' || playedEvent(g) || !eraFrom) return false;
@@ -750,6 +775,38 @@ export function heldInEra(g, eraFrom) {
  */
 export function pendingFixed(g, edge) {
     return !!edge && !!g && g.kind === 'fixed' && !playedEvent(g) && g.from != null && String(g.from) === String(edge);
+}
+
+/**
+ * Финал эпохи сыгран: у неё есть фиксированные точки ровно в последнем месяце (era.to), и каждая отмечена сыгранной
+ * (gc.played; с датой сцены — не позже даты чата: в ветке «до» финал ещё впереди). Тогда стыка больше нет — всё, что
+ * случается и узнаётся в финале, случилось и известно, как если бы дата ушла за конец эпохи. Нет таких точек — false:
+ * финал закрывает только дата.
+ */
+export function finalePlayed(book, era, date = null) {
+    if (!era?.to || !book?.entries) return false;
+    const fin = Object.values(book.entries)
+        .filter(e => e?.gc?.kind === 'fixed' && isCanon(e.gc) && e.gc.from != null && String(e.gc.from) === String(era.to));
+    return fin.length > 0 && fin.every(e => playedEvent(e.gc)
+        && !(date && typeof e.gc.played === 'string' && e.gc.played > String(date)));
+}
+
+/**
+ * Что в этой эпохе ждёт сцены на дату (вид автора): фиксированные точки финала (pendingFixed — пока дата в последнем
+ * месяце) и события эпохи, до которых дата дошла, а сыгранными они не отмечены (heldInEra) — сводка «что было» их не
+ * показывает. Для списка «отметить сыгранным».
+ */
+export function waitingEvents(book, era, date) {
+    const at = date || null;
+    if (!book?.entries || !era || !at) return [];
+    const edge = edgeOf(era, at);
+    return Object.entries(book.entries)
+        .map(([k, e]) => ({ e, uid: Number(e?.uid ?? k) }))
+        .filter(({ e }) => e?.gc && isCanon(e.gc) && e.gc.from != null
+            && (pendingFixed(e.gc, edge) || (heldInEra(e.gc, era.from) && String(e.gc.from) <= String(at))))
+        .map(({ e, uid }) => ({ uid, kind: e.gc.kind, from: String(e.gc.from), title: cleanTitle(e.comment),
+            final: e.gc.kind === 'fixed' }))
+        .sort((a, b) => a.from.localeCompare(b.from) || a.uid - b.uid);
 }
 
 /**
@@ -796,7 +853,7 @@ export function chronicleBlock(book, scope, books, { world, eraFrom, ahead = 4, 
     // сыграно: gc.played (true или дата сцены) или пришло из чата (src.chat / src.stmb). Ролка могла до него ещё не
     // дойти — сводка не должна обгонять чат. Дата ровно в начало эпохи — завязка, она уже была.
     const held = (g) => heldInEra(g, from);
-    const when = (g) => (typeof g.played === 'string' && g.played ? g.played : String(g.from));
+    const when = whenOf;
     const pending = (g) => pendingFixed(g, scope?.edge);
     const seen = all.filter(e => when(e.gc) <= at
         && !held(e.gc) && !pending(e.gc)
@@ -809,7 +866,8 @@ export function chronicleBlock(book, scope, books, { world, eraFrom, ahead = 4, 
         return !(p && keep.has(p) && p.gc.to && String(p.gc.to) <= from);   // далёкий отрезок — одной строкой родителя
     }).sort((a, b) => when(a.gc).localeCompare(when(b.gc)));
     const tail = past.slice(-maxPast);
-    const next = all.filter(e => e.gc.kind === 'fixed' && (String(e.gc.from) > at || pending(e.gc)))
+    // сыграна датой позже этой (ветка «до» сцены) — здесь она ещё впереди
+    const next = all.filter(e => e.gc.kind === 'fixed' && (when(e.gc) > at || pending(e.gc)))
         .sort((a, b) => String(a.gc.from).localeCompare(String(b.gc.from))).slice(0, ahead);
     const parts = [];
     if (tail.length) parts.push(`[Хроника мира — что было до ${fmtDate(at)} и что из этого известно говорящему]\n` + tail.map(line).join('\n'));
@@ -939,8 +997,15 @@ async function resolve() {
         dateSource = sd.source;
         // дата ушла за конец эпохи (трекер, метка «с этого места») — её финал уже сыгран: всё, что случается и
         // узнаётся в последнем месяце, случилось и известно. Копия — запись Реестра не трогаем.
-        if (sd.date && era.to && date !== sd.date && String(sd.date) > String(era.to)) era = { ...era, over: true };
+        if (sd.date && era.to && date !== sd.date && String(sd.date) > String(era.to)) era = { ...era, over: 'date' };
         if (!date && era.to) { date = era.from; dateSource = 'начало эпохи'; }
+        // …или все фиксированные точки её финала отмечены сыгранными (Хронику читаем только на стыке; у ST она в кэше)
+        if (!era.over && edgeOf(era, date)) {
+            const name = worldRecord(data)?.chronicle;
+            let book = null;
+            try { book = name ? await c.loadWorldInfo?.(name) : null; } catch { /* без Хроники — по дате */ }
+            if (finalePlayed(book, era, date)) era = { ...era, over: 'played' };
+        }
     }
     current = { chatId, era, explicit, date, dateSource, world, registry: current.registry };
     return { data, era, explicit, date, md, world };
@@ -1096,7 +1161,7 @@ export function canonBrief({ data, era, date, book, cast = [] }) {
     const entries = Object.values(book?.entries || {}).filter(e => e?.gc && CHRON_KINDS.includes(e.gc.kind) && e.gc.from
         && (!e.gc.status || e.gc.status === 'canon'));
     const edge = edgeOf(era, at);
-    const ahead = entries.filter(e => e.gc.kind === 'fixed' && (String(e.gc.from) > at || pendingFixed(e.gc, edge)))
+    const ahead = entries.filter(e => e.gc.kind === 'fixed' && (whenOf(e.gc) > at || pendingFixed(e.gc, edge)))
         .sort((a, b) => String(a.gc.from).localeCompare(String(b.gc.from))).slice(0, 4);
     if (ahead.length) lines.push(`Канон — впереди, ломать нельзя (в сцене о них не знают): ${ahead.map(e => cleanTitle(e.comment)).join('; ')}.`);
     const gone = ids.filter(g => (g.slices || []).length && !presentAt(g, at, edge)).map(g => `${g.name} — ${goneReason(g, at)}`);
@@ -1112,7 +1177,7 @@ export function canonBrief({ data, era, date, book, cast = [] }) {
         const secrets = [];
         for (const e of entries) {
             const g = e.gc;
-            if (!g.secret || String(g.from) > at || isPublic(g, at, edge) || heldInEra(g, era.from)) continue;
+            if (!g.secret || whenOf(g) > at || isPublic(g, at, edge) || heldInEra(g, era.from)) continue;
             if (g.kind === 'state' && g.to && at > String(g.to) && !at.startsWith(String(g.to))) continue;
             if (turning(g)) continue;
             const yes = who.filter(id => knowsAt(g, id));
@@ -1392,6 +1457,7 @@ export function chronographModel(data, book) {
             persona: e.persona ? (sliceById(data, e.persona)?.slice?.label || null) : null,
             note: e.note ? String(e.note).split(/(?<=[.!?])\s/)[0].slice(0, 220) : '',
             queue: { review: mine.filter(x => x.gc.status === 'review').length, nexus: mine.filter(x => x.gc.status === 'nexus').length },
+            finale: e.to ? finalePlayed(book, e) : false,
         };
     }).sort((a, b) => String(a.from || '9999').localeCompare(String(b.from || '9999')));
     const eraAt = (d) => {
@@ -1404,6 +1470,11 @@ export function chronographModel(data, book) {
             uid: e.uid, kind: e.gc.kind, from: String(e.gc.from), to: e.gc.to ? String(e.gc.to) : null, approx: !!e.gc.approx,
             sym: CHRON_SYM[e.gc.kind] || '•', title: cleanTitle(e.comment), who: (e.gc.who || []).map(nameOf),
             secret: !!e.gc.secret && !isPublic(e.gc, '9999'), played: playedEvent(e.gc), era: eraAt(e.gc.from),
+            // отметка «сыграно»: дата сцены, если есть; manual — её ставила автор (можно снять), иначе событие пришло
+            // из чата; waits — эпохи, где событие ждёт сцены, пока не отмечено: финал эпохи или её событие
+            playedAt: typeof e.gc.played === 'string' && e.gc.played ? e.gc.played : null, manual: !!e.gc.played,
+            waits: ['fixed', 'event'].includes(e.gc.kind) ? eras.filter(x => (e.gc.kind === 'fixed' && x.to && String(e.gc.from) === x.to)
+                || (heldInEra({ ...e.gc, played: false, src: null }, x.from) && (!x.to || String(e.gc.from) <= x.to || String(e.gc.from).startsWith(x.to)))).map(x => x.id) : [],
             text: String(e.content || '').slice(0, 1200),
         }))
         .sort((a, b) => a.from.localeCompare(b.from) || a.uid - b.uid);
@@ -1708,7 +1779,7 @@ export function buildContext(data, cur, c) {
         v: 1,
         world: w ? { id: w.id || null, name: w.name || null, chronicle: w.chronicle || null, defaultEra: w.defaultEra ? String(w.defaultEra) : null } : null,
         era: { id: String(era.id), label: era.label || '', from: era.from || null, to: era.to || null,
-            status: era.status || null, memoryBook: era.memoryBook || null, history: historyBooks(data, era),
+            over: era.over || false, status: era.status || null, memoryBook: era.memoryBook || null, history: historyBooks(data, era),
             lore: [...(era.lore || [])] },
         explicit: !!cur.explicit,
         chatId: cur.chatId || null,
@@ -1904,10 +1975,12 @@ async function onChatChanged({ reset = true } = {}) {
     if (ctx().getCurrentChatId?.() === chatId) {
         try { await publish(data); } catch (e) { console.warn(TAG, 'снимок для расширок не разослан', e); }
         if (reset) {
+            justPlayed.clear();
             await refreshCanon();
             await refreshDrafts();
             setTimeout(paintStrazh, 600);
         }
+        await refreshWaiting();   // дата идёт вместе с чатом — список «ждут сцены» тоже
     }
     renderStatus();
     if (!data || !era || !explicit || ctx().getCurrentChatId?.() !== chatId) return;
@@ -2046,7 +2119,7 @@ function statusLines() {
     }
     const how = current.explicit ? '' : ' (по умолчанию — чат в Реестре не отмечен)';
     out.push(`Эпоха: <b>${esc(current.era.id)}</b> — ${esc(current.era.label || '')}${how}`);
-    out.push(current.date ? `Дата сюжета: ${esc(fmtDate(current.date))}${current.dateSource ? ` (${esc(current.dateSource)})` : ''}${current.era.over ? ' — за концом эпохи: её финал считаю сыгранным' : edgeOf(current.era, current.date) ? ' — финал эпохи: что случается и узнаётся в этом месяце, ещё впереди' : ''}` : 'Дата сюжета: не видна — лорбуки по датам не режу.');
+    out.push(current.date ? `Дата сюжета: ${esc(fmtDate(current.date))}${current.dateSource ? ` (${esc(current.dateSource)})` : ''}${current.era.over === 'played' ? ' — финал эпохи сыгран (его фиксированные точки отмечены): что случается и узнаётся в этом месяце, уже случилось' : current.era.over ? ' — за концом эпохи: её финал считаю сыгранным' : edgeOf(current.era, current.date) ? ' — финал эпохи: что случается и узнаётся в этом месяце, ещё впереди (сыграла — отметь ниже, «Ждут сцены»)' : ''}` : 'Дата сюжета: не видна — лорбуки по датам не режу.');
     const pruned = ctx().chatMetadata?.[MODULE]?.backstagePruned;
     if (Array.isArray(pruned) && pruned.length) out.push(`Закулисье: убраны ${esc(pruned.join(', '))}`);
     if (lastBooks && (lastBooks.added.length || lastBooks.missing.length)) {
@@ -2220,6 +2293,72 @@ async function refreshDrafts() {
     renderCanon();
 }
 
+/** Список «ждут сцены» этого чата — только там, где сводку Хроники собирает ядро (не ★ХРОНОЛОГИЯ). */
+async function refreshWaiting() {
+    lastWaiting = [];
+    try {
+        const { data, era, explicit, date } = await resolve();
+        const w = data ? worldRecord(data) : null;
+        if (settings().chronicle && data && era && explicit && date && w?.chronicle) {
+            const book = await ctx().loadWorldInfo?.(w.chronicle);
+            if (book?.entries && !legacyChronicleActive(book, era.id)) {
+                lastWaiting = waitingEvents(book, era, date);
+                for (const [uid, row] of justPlayed) {
+                    const g = entryByUid(book, uid)?.gc;
+                    if (g?.played && !lastWaiting.some(x => x.uid === uid)) lastWaiting.push({ ...row, done: true });
+                }
+            }
+        }
+    } catch (e) {
+        console.warn(TAG, 'список «ждут сцены» не собрался', e);
+    }
+    renderCanon();
+}
+
+/** Дата события попадает в эпоху (её последний месяц — тоже её). */
+const inEraSpan = (from, era) => !!era && (!era.from || from >= String(era.from) || String(era.from).startsWith(from))
+    && (!era.to || from <= String(era.to) || from.startsWith(String(era.to)));
+
+/**
+ * Отметить событие Хроники сыгранным или снять отметку — из Хронографа (Фойе) и из списка «Ждут сцены». value: true —
+ * сыграно: в чате эпохи, к которой событие относится, отметка ставится датой сюжета (день — с трекера), вне чата —
+ * просто «да»; дата — ею; false — снять. Возвращает { uid, played } — что теперь записано в Хронике.
+ */
+async function markPlayed(uid, value = true) {
+    const res = await withChronicle((chron) => {
+        const entry = entryByUid(chron, uid);
+        if (!entry?.gc) throw new Error('нет такой записи Хроники');
+        let val = value;
+        if (val === true && current.chatId && current.explicit && current.date && inEraSpan(String(entry.gc.from ?? ''), current.era)) val = current.date;
+        const played = setPlayed(entry, val);
+        if (played === undefined) throw new Error(['fixed', 'event'].includes(entry.gc.kind) ? `не поняла дату «${String(value)}»` : 'сыгранными отмечаются только события и фиксированные точки');
+        const row = { uid: Number(uid), kind: entry.gc.kind, from: String(entry.gc.from ?? ''), title: cleanTitle(entry.comment), final: entry.gc.kind === 'fixed' };
+        if (played) justPlayed.set(Number(uid), row); else justPlayed.delete(Number(uid));
+        return { uid: Number(uid), played };
+    });
+    if (ctx().getCurrentChatId?.()) await onChatChanged({ reset: false });
+    return res;
+}
+
+/** Название без даты в начале («03.1961 — переезд» → «переезд»): дата и так стоит рядом. */
+const untitled = (t) => {
+    const s = String(t || '');
+    const i = s.indexOf(' — ');
+    return i > 0 && i <= 24 && /\d/.test(s.slice(0, i)) ? s.slice(i + 3) : s;
+};
+
+function waitingHtml() {
+    if (!lastWaiting.length) return '';
+    const open = lastWaiting.filter(x => !x.done);
+    const fin = open.some(x => x.final);
+    const row = x => `<div class="st-wait${x.done ? ' st-wait--done' : ''}" data-uid="${x.uid}">
+      <span>${x.final ? '◆' : '●'} ${esc(fmtDate(x.from))} — ${esc(untitled(x.title))}</span>
+      <button class="menu_button st-wait-act" data-act="${x.done ? 'unplay' : 'play'}">${x.done ? '↶ снять' : '✓ сыграно'}</button></div>`;
+    return `<div class="st-canon st-waits"><div class="st-canon-h">Ждут сцены${open.length ? ` — ${open.length}` : ''}${fin ? ' · финал эпохи впереди' : ''}</div>
+      <div class="st-draft-m">До этих событий дата дошла, а сыгранными они не отмечены — в «что было» их нет${fin ? '; ◆ — финал эпохи: отметишь все — всё, что в нём случается и узнаётся, станет прошлым' : ''}.</div>
+      ${lastWaiting.map(row).join('')}</div>`;
+}
+
 function draftHtml(d) {
     const rv = d.review;
     const note = rv && d.status !== 'canon'
@@ -2362,7 +2501,7 @@ function canonHtml() {
 
 function renderCanon() {
     if (typeof $ !== 'function') return;
-    $('#sacred_timeline_canon').html(canonHtml());
+    $('#sacred_timeline_canon').html(canonHtml() + waitingHtml());
     try { globalThis.LifeBridge?.api?.renderSoon?.(); } catch { /* */ }
 }
 
@@ -2506,6 +2645,13 @@ function bindCanonUi() {
         actDraft(uid, act, words).catch(e => { console.warn(TAG, e); window.toastr?.error(esc(String(e?.message || e)), 'Канон'); })
             .finally(() => $(this).prop('disabled', false));
     });
+    $(document).on('click', '.st-wait-act', function () {
+        const uid = $(this).closest('.st-wait').data('uid');
+        $(this).prop('disabled', true);
+        markPlayed(uid, $(this).data('act') === 'play')
+            .catch(e => { console.warn(TAG, e); window.toastr?.error(esc(String(e?.message || e)), 'Хроника'); })
+            .finally(() => $(this).prop('disabled', false));
+    });
     $(document).on('click', '.st-strazh-h', function () { $(this).closest('.st-strazh').toggleClass('open'); });
     $(document).on('click', '.st-strazh-ok', function () {
         const key = $(this).closest('.st-strazh').data('key');
@@ -2602,6 +2748,11 @@ if (typeof jQuery === 'function') {
                 const book = w.chronicle ? await ctx().loadWorldInfo?.(w.chronicle) : null;
                 return chronographModel(data, book);
             },
+            /**
+             * Отметить событие Хроники сыгранным: played(uid) — да (в чате его эпохи — датой сюжета), played(uid, дата),
+             * played(uid, false) — снять. Все фиксированные точки финала эпохи отмечены — её финал сыгран.
+             */
+            played: (uid, value = true) => markPlayed(uid, value),
             /** Войти в эпоху: открыть её каноничный чат (или chatId) — дальше ядро переключит всё само. */
             enter: (eraId, chatId) => enterEra(eraId, chatId),
             /** Облик человека на дату (по имени или алиасу личности, необязательно — по карточке): { identity, slice, label } | null. */
