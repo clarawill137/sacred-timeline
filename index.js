@@ -743,15 +743,13 @@ export function heldInEra(g, eraFrom) {
 }
 
 /**
- * Фиксированная точка этого самого месяца (года): дата сюжета внутри него, а дня у точки нет — случилась ли она уже,
- * по дате не понять. Пока она не отмечена сыгранной (gc.played), она «впереди» — режиссёру, а не в «что было»: финал
- * эпохи не должен оказаться прошлым раньше, чем его сыграли. Завязка эпохи (дата ровно в её начало) уже была.
+ * Фиксированная точка финала: её дата — ровно последний месяц эпохи (edge, см. edgeOf), и сюжет сейчас внутри него.
+ * Случилась ли она уже, по дате не понять: пока она не отмечена сыгранной (gc.played), она «впереди» — режиссёру, а
+ * не в «что было»: финал эпохи не должен оказаться прошлым раньше, чем его сыграли. Точки с днём и точки посреди
+ * эпохи считаются по дате, как всегда.
  */
-export function pendingFixed(g, at, eraFrom) {
-    if (!g || g.kind !== 'fixed' || playedEvent(g) || !at || !g.from) return false;
-    const f = String(g.from);
-    const from = String(eraFrom || '');
-    return String(at).startsWith(f) && (!from || f > from || (f !== from && from.startsWith(f)));
+export function pendingFixed(g, edge) {
+    return !!edge && !!g && g.kind === 'fixed' && !playedEvent(g) && g.from != null && String(g.from) === String(edge);
 }
 
 /**
@@ -799,7 +797,7 @@ export function chronicleBlock(book, scope, books, { world, eraFrom, ahead = 4, 
     // дойти — сводка не должна обгонять чат. Дата ровно в начало эпохи — завязка, она уже была.
     const held = (g) => heldInEra(g, from);
     const when = (g) => (typeof g.played === 'string' && g.played ? g.played : String(g.from));
-    const pending = (g) => !scope?.over && pendingFixed(g, at, from);
+    const pending = (g) => pendingFixed(g, scope?.edge);
     const seen = all.filter(e => when(e.gc) <= at
         && !held(e.gc) && !pending(e.gc)
         && !(e.gc.kind === 'state' && e.gc.to && !(at < String(e.gc.to)))
@@ -1097,10 +1095,10 @@ export function canonBrief({ data, era, date, book, cast = [] }) {
     const lines = [`Канон (Священный таймлайн): эпоха «${era.label || era.id}», дата сюжета — ${fmtDate(at)}. Никто не знает будущего — того, что случится позже этой даты.`];
     const entries = Object.values(book?.entries || {}).filter(e => e?.gc && CHRON_KINDS.includes(e.gc.kind) && e.gc.from
         && (!e.gc.status || e.gc.status === 'canon'));
-    const ahead = entries.filter(e => e.gc.kind === 'fixed' && (String(e.gc.from) > at || (!era.over && pendingFixed(e.gc, at, era.from))))
+    const edge = edgeOf(era, at);
+    const ahead = entries.filter(e => e.gc.kind === 'fixed' && (String(e.gc.from) > at || pendingFixed(e.gc, edge)))
         .sort((a, b) => String(a.gc.from).localeCompare(String(b.gc.from))).slice(0, 4);
     if (ahead.length) lines.push(`Канон — впереди, ломать нельзя (в сцене о них не знают): ${ahead.map(e => cleanTitle(e.comment)).join('; ')}.`);
-    const edge = edgeOf(era, at);
     const gone = ids.filter(g => (g.slices || []).length && !presentAt(g, at, edge)).map(g => `${g.name} — ${goneReason(g, at)}`);
     if (gone.length) lines.push(`Канон — в этом времени нет (не могут быть в сцене): ${gone.slice(0, 10).join('; ')}.`);
     const who = [...new Set(cast.filter(Boolean))];
