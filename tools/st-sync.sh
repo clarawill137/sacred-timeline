@@ -11,7 +11,8 @@
 # Синкаются только: worlds/*.json, OpenAI Settings/*.json, groups/*.json, characters/*.png,
 # User Avatars/*.png (аватарки персон: картинки, без настроек персон).
 # Из settings.json уезжает только выжимка (_export/settings-safe.json): персоны, привязки
-# лорбуков, теги. Ключи API (secrets.json, токены расширений) и бэкапы никогда не уезжают.
+# лорбуков, теги; с 17.11 ещё наборы ExtBlocks (_export/extblocks.json) и список скриптов Tavern Helper
+# (_export/th-scripts.json) — без ключей, адресов API и кода. Ключи API (secrets.json, токены расширений) и бэкапы никогда не уезжают.
 # Чаты: всегда уезжает только их список (_export/chats-index.json). Сами чаты — лишь те, что
 # Claude попросил в _request/chats.txt (в _chats/). Чаты от Claude (_out/) ставятся только
 # НОВЫМИ файлами — существующий чат мост не перезапишет никогда.
@@ -608,10 +609,56 @@ out = {
     'extensions': sorted((s.get('extension_settings') or {}).keys()),
 }
 open(sys.argv[2], 'w', encoding='utf-8').write(json.dumps(out, ensure_ascii=False, indent=2) + '\n')
+
+# ExtBlocks (наборы внешних блоков: промпты, типы, порядок) и скрипты Tavern Helper (имя, вкл, кнопки, описание) —
+# чтобы Claude видел, что пишут блоки, и делал наборы под эпохи. Без ключей, токенов, адресов API и кода скриптов.
+import os, re
+SECRET = re.compile(r'(api_?key|apikey|token|secret|passw|auth|bearer|cookie|^key$|_key$|endpoint|api_?url|proxy)', re.I)
+
+
+def clean(o):
+    if isinstance(o, dict):
+        return {k: clean(v) for k, v in o.items() if not SECRET.search(str(k))}
+    if isinstance(o, list):
+        return [clean(x) for x in o]
+    return o
+
+
+ext = s.get('extension_settings') or {}
+eb = ext.get('ExtBlocks')
+if isinstance(eb, dict):
+    open(os.path.join(os.path.dirname(sys.argv[2]), 'extblocks.json'), 'w', encoding='utf-8').write(
+        json.dumps(clean(eb), ensure_ascii=False, indent=2) + '\n')
+scripts = []
+
+
+def walk(o, where):
+    if isinstance(o, dict):
+        if o.get('type') == 'script' and 'name' in o:
+            btn = o.get('button') or {}
+            scripts.append({'where': where, 'name': o.get('name'), 'enabled': o.get('enabled'), 'info': o.get('info', ''),
+                            'buttons': [b.get('name') for b in (btn.get('buttons') or []) if isinstance(b, dict)]
+                            if btn.get('enabled') else []})
+            return
+        for k, v in o.items():
+            walk(v, f'{where}.{k}' if where else k)
+    elif isinstance(o, list):
+        for x in o:
+            walk(x, where)
+
+
+walk(ext.get('tavern_helper') or {}, 'tavern_helper')
+walk(s.get('oai_settings') or {}, 'oai_settings')
+if scripts:
+    open(os.path.join(os.path.dirname(sys.argv[2]), 'th-scripts.json'), 'w', encoding='utf-8').write(
+        json.dumps(scripts, ensure_ascii=False, indent=2) + '\n')
 PYEOF
   then
     mkdir -p "$MIRROR/$EXPORT_DIR"
     cp -- "$TMPD/export/settings-safe.json" "$MIRROR/$EXPORT_DIR/"
+    for f in extblocks.json th-scripts.json; do
+      [[ -f "$TMPD/export/$f" ]] && cp -- "$TMPD/export/$f" "$MIRROR/$EXPORT_DIR/"
+    done
   else
     warn "Персоны не выгрузились."
   fi
