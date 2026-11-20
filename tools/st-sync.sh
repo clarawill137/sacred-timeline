@@ -20,6 +20,8 @@
 # (подтянуть, если стоит), «+ ссылка» (ещё и поставить, если нет), «- папка» (убрать в бэкап). Только свои репы
 # (github.com/clarawill137), только fast-forward; папку с твоими правками не трогает. Чужие пропатченные
 # расширки мост не обновляет никогда.
+# Какие папки расширок лежат со своими правками (патчи), мост при каждом снимке кладёт в файлы таверны:
+# user/files/life-ext-dirty.json — по этому списку окно «Расширения» в Life само держит их под замком «не обновлять».
 # Свои расширки без репы: строка «= папка» в extensions.txt — файлы папки extensions/<папка> (верхний уровень) ходят
 # через эту же репу, как лорбуки: снимок с сервера → правки Claude → на сервер. Только код и тексты (js, css, json,
 # html, md…), без бэкапов и файлов с «secret/token» в имени. Папку-клон git так не берёт.
@@ -42,6 +44,7 @@ REQUEST_FILE="_request/chats.txt"
 OUT_DIR="_out"         # новые чаты от Claude: только новыми файлами
 EXT_LIST="extensions.txt"                 # свои расширки: что держать на сервере (пишет Claude)
 EXT_INDEX="extensions-index.json"         # что стоит на сервере — в _export, только для чтения
+EXT_DIRTY="user/files/life-ext-dirty.json" # папки расширок со своими правками — в файлы таверны, для окна «Расширения» в Life (от DATA)
 EXT_ALLOW="${ST_SYNC_EXT_ALLOW:-^https://github\.com/clarawill137/[A-Za-z0-9._-]+$}"
 EXT_TRASH="backups/extensions-removed"    # куда уезжают убранные расширки (от DATA)
 SELF_URL="https://raw.githubusercontent.com/clarawill137/sacred-timeline/main/tools/st-sync.sh"
@@ -389,8 +392,8 @@ export_extensions() {
   command -v python3 >/dev/null || return 0
   ct_ext_index > "$TMPD/extidx" 2>/dev/null || { warn "Не вышло прочитать список расширок."; return 0; }
   mkdir -p "$TMPD/export"
-  python3 - "$TMPD/extidx" "$TMPD/export/$EXT_INDEX" <<'PYEOF' || { warn "Список расширок не собрался."; return 0; }
-import json, sys
+  python3 - "$TMPD/extidx" "$TMPD/export/$EXT_INDEX" "$TMPD/ext-dirty.json" <<'PYEOF' || { warn "Список расширок не собрался."; return 0; }
+import json, os, sys
 rows = []
 for line in open(sys.argv[1], encoding='utf-8', errors='replace'):
     p = line.rstrip('\n').split('\t')
@@ -400,9 +403,29 @@ for line in open(sys.argv[1], encoding='utf-8', errors='replace'):
     rows.append({'path': folder, 'repo': url or None, 'commit': head or None, 'localChanges': dirty == '1', 'version': ver or None})
 rows.sort(key=lambda r: r['path'].lower())
 open(sys.argv[2], 'w', encoding='utf-8').write(json.dumps(rows, ensure_ascii=False, indent=2) + '\n')
+# имена папок, где на сервере лежат свои правки (патчи чужих расширок): без дат — файл меняется только вместе со списком
+dirty = sorted({os.path.basename(r['path']) for r in rows if r['localChanges']}, key=str.lower)
+open(sys.argv[3], 'w', encoding='utf-8').write(json.dumps({'dirty': dirty}, ensure_ascii=False) + '\n')
 PYEOF
   mkdir -p "$MIRROR/$EXPORT_DIR"
   cp -- "$TMPD/export/$EXT_INDEX" "$MIRROR/$EXPORT_DIR/"
+  put_ext_dirty "$TMPD/ext-dirty.json"
+}
+
+# Тот же ответ «где лежат свои правки» — в файлы таверны (/user/files/…): окно «Расширения» в Life само держит такие
+# папки под замком «не обновлять». Пишется, только если список изменился; не вышло — синк идёт дальше.
+put_ext_dirty() { # $1 — свежий файл на хосте
+  local cur="$TMPD/ext-dirty.cur" dir=${EXT_DIRTY%/*}
+  mkdir -p "$TMPD/ext-dirty-old"
+  if ct_fetch "$TMPD/ext-dirty-old" "$EXT_DIRTY" 2>/dev/null && [[ -f "$TMPD/ext-dirty-old/$EXT_DIRTY" ]]; then
+    cp -- "$TMPD/ext-dirty-old/$EXT_DIRTY" "$cur"
+    cmp -s "$1" "$cur" && return 0
+  fi
+  ct_mkdir "$dir" 2>/dev/null || return 0
+  ct_put "$1" "$EXT_DIRTY" 2>/dev/null || { warn "Не вышло положить список папок с правками в файлы таверны."; return 0; }
+  local owner; owner=$(ct_owner 2>/dev/null) || owner=""
+  [[ -n $owner ]] && { ct_chown "$owner" "$dir" 2>/dev/null || true; ct_chown "$owner" "$EXT_DIRTY" 2>/dev/null || true; }
+  return 0
 }
 
 # одна строка списка → в контейнере: подтянуть / поставить / убрать. Печатает итог одним словом и подробности.
